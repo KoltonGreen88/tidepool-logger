@@ -329,6 +329,7 @@ _DEFAULTS = {
     "recommendation_overrides": {},
     "ca_gen": 0,
     "ca_logged_campaigns": set(),
+    "g_search_results": None,
 }
 for _k, _v in _DEFAULTS.items():
     if _k not in st.session_state:
@@ -394,112 +395,228 @@ with gifting_tab:
         st.session_state["g_success"] = ""
 
     st.markdown("### Log a Gift")
-
-    # ── AI parse ──────────────────────────────────────────────────────────────
-    parse_text = st.text_area(
-        "Describe the gifting — AI will pre-fill the form below",
-        height=80,
-        placeholder="e.g. Dropped off 3 bags at Exhale Spa for Sarah on May 30th",
-        key="g_parse_input",
+    g_mode = st.radio(
+        "Mode",
+        ["Log New Gift", "Update Existing Record"],
+        horizontal=True,
+        key="g_mode",
+        label_visibility="collapsed",
     )
-    if st.button("Parse with AI →", key="parse_btn"):
-        if not parse_text.strip():
-            st.warning("Enter a description first.")
-        else:
-            with st.spinner("Parsing..."):
-                try:
-                    st.session_state["g_parsed"] = parse_with_ai(parse_text)
-                    st.rerun()
-                except Exception as exc:
-                    st.error(f"AI parse failed: {exc}")
+    st.markdown("---")
 
-    parsed = st.session_state["g_parsed"]
+    # ── MODE: Log New Gift ────────────────────────────────────────────────────
+    if g_mode == "Log New Gift":
 
-    # ── Gifting form ──────────────────────────────────────────────────────────
-    # GiftingLog columns:
-    # Timestamp | Recipient | Bags | Venue | Date | LoggedBy | Notes | Posted | PostLink | ContentType
-    with st.form("gifting_form", clear_on_submit=True):
-        recipient = st.text_input(
-            "Recipient *",
-            value=parsed.get("recipient", ""),
-            placeholder="Name, handle, or contact",
-        )
-        bags = st.number_input(
-            "Bags *",
-            min_value=0,
-            step=1,
-            value=max(0, int(parsed.get("bags") or 0)),
-        )
-        venue = st.text_input(
-            "Venue *",
-            value=parsed.get("venue", ""),
-            placeholder="Studio, spa, hotel, event space…",
-        )
-
-        default_date = date.today()
-        if parsed.get("date"):
-            try:
-                default_date = dateparser.parse(str(parsed["date"])).date()
-            except Exception:
-                pass
-        gift_date = st.date_input("Date *", value=default_date)
-
-        logged_by = st.radio("Logged By *", ["Kolton", "Cameron"], horizontal=True)
-
-        notes = st.text_area(
-            "Notes",
-            value=str(parsed.get("notes", "") or ""),
-            placeholder="Context, relationship, follow-up needed…",
+        # ── AI parse ──────────────────────────────────────────────────────────
+        parse_text = st.text_area(
+            "Describe the gifting — AI will pre-fill the form below",
             height=80,
+            placeholder="e.g. Dropped off 3 bags at Exhale Spa for Sarah on May 30th",
+            key="g_parse_input",
         )
+        if st.button("Parse with AI →", key="parse_btn"):
+            if not parse_text.strip():
+                st.warning("Enter a description first.")
+            else:
+                with st.spinner("Parsing..."):
+                    try:
+                        st.session_state["g_parsed"] = parse_with_ai(parse_text)
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"AI parse failed: {exc}")
 
-        posted = st.checkbox("They posted")
-        post_link = st.text_input(
-            "Post Link",
-            placeholder="https://instagram.com/p/…",
-            help="Only recorded when 'Posted' is checked.",
-        )
-        st.caption("Content type (Instagram, TikTok, etc.) is auto-detected from the URL on submit.")
+        parsed = st.session_state["g_parsed"]
 
-        submitted = st.form_submit_button("Log Gift →")
+        # ── Gifting form ──────────────────────────────────────────────────────
+        # GiftingLog columns:
+        # Timestamp | Recipient | Bags | Venue | Date | LoggedBy | Notes | Posted | PostLink | ContentType
+        with st.form("gifting_form", clear_on_submit=True):
+            recipient = st.text_input(
+                "Recipient *",
+                value=parsed.get("recipient", ""),
+                placeholder="Name, handle, or contact",
+            )
+            bags = st.number_input(
+                "Bags *",
+                min_value=0,
+                step=1,
+                value=max(0, int(parsed.get("bags") or 0)),
+            )
+            venue = st.text_input(
+                "Venue *",
+                value=parsed.get("venue", ""),
+                placeholder="Studio, spa, hotel, event space…",
+            )
 
-    if submitted:
-        errors = []
-        if not recipient.strip():
-            errors.append("Recipient is required.")
-        if bags <= 0:
-            errors.append("Bags must be at least 1.")
-        if not venue.strip():
-            errors.append("Venue is required.")
+            default_date = date.today()
+            if parsed.get("date"):
+                try:
+                    default_date = dateparser.parse(str(parsed["date"])).date()
+                except Exception:
+                    pass
+            gift_date = st.date_input("Date *", value=default_date)
 
-        if errors:
-            for err in errors:
-                st.error(err)
-        else:
-            used_link = post_link.strip() if posted else ""
-            content_type = detect_content_type(used_link) if used_link else ""
-            timestamp = datetime.now().isoformat(timespec="seconds")
-            row = [
-                timestamp,
-                recipient.strip(),
-                int(bags),
-                venue.strip(),
-                gift_date.isoformat(),
-                logged_by,
-                notes.strip(),
-                "Yes" if posted else "No",
-                used_link,
-                content_type,
-            ]
-            with st.spinner("Saving to SharePoint…"):
-                ok = append_row(st.secrets["GIFTING_FILE_ID"], "GiftingLog", row)
-            if ok:
-                st.session_state["g_success"] = (
-                    f"Logged: {recipient.strip()} · {int(bags)} bags · "
-                    f"{venue.strip()} · {gift_date.isoformat()}"
-                )
-                st.session_state["g_parsed"] = {}
+            logged_by = st.radio("Logged By *", ["Kolton", "Cameron"], horizontal=True)
+
+            notes = st.text_area(
+                "Notes",
+                value=str(parsed.get("notes", "") or ""),
+                placeholder="Context, relationship, follow-up needed…",
+                height=80,
+            )
+
+            posted = st.checkbox("They posted")
+            post_link = st.text_input(
+                "Post Link",
+                placeholder="https://instagram.com/p/…",
+                help="Only recorded when 'Posted' is checked.",
+            )
+            st.caption("Content type (Instagram, TikTok, etc.) is auto-detected from the URL on submit.")
+
+            submitted = st.form_submit_button("Log Gift →")
+
+        if submitted:
+            errors = []
+            if not recipient.strip():
+                errors.append("Recipient is required.")
+            if bags <= 0:
+                errors.append("Bags must be at least 1.")
+            if not venue.strip():
+                errors.append("Venue is required.")
+
+            if errors:
+                for err in errors:
+                    st.error(err)
+            else:
+                used_link = post_link.strip() if posted else ""
+                content_type = detect_content_type(used_link) if used_link else ""
+                timestamp = datetime.now().isoformat(timespec="seconds")
+                row = [
+                    timestamp,
+                    recipient.strip(),
+                    int(bags),
+                    venue.strip(),
+                    gift_date.isoformat(),
+                    logged_by,
+                    notes.strip(),
+                    "Yes" if posted else "No",
+                    used_link,
+                    content_type,
+                ]
+                with st.spinner("Saving to SharePoint…"):
+                    ok = append_row(st.secrets["GIFTING_FILE_ID"], "GiftingLog", row)
+                if ok:
+                    st.session_state["g_success"] = (
+                        f"Logged: {recipient.strip()} · {int(bags)} bags · "
+                        f"{venue.strip()} · {gift_date.isoformat()}"
+                    )
+                    st.session_state["g_parsed"] = {}
+                    st.rerun()
+
+    # ── MODE: Update Existing Record ──────────────────────────────────────────
+    else:
+
+        # ── Search ────────────────────────────────────────────────────────────
+        g_search_q = st.text_input("Search recipient name", key="g_search_q")
+        if st.button("Search →", key="g_search_btn"):
+            if not g_search_q.strip():
+                st.warning("Enter a name to search.")
+            else:
+                with st.spinner("Searching SharePoint…"):
+                    _all_rows = get_table_rows(st.secrets["GIFTING_FILE_ID"], "GiftingLog")
+                _matches = [
+                    r for r in _all_rows
+                    if g_search_q.strip().lower() in str(r.get("values", [[]])[0][1] if r.get("values") else "").lower()
+                ]
+                st.session_state["g_search_results"] = _matches
                 st.rerun()
+
+        _results = st.session_state.get("g_search_results")
+
+        if _results is not None:
+            if not _results:
+                st.info("No matching records found.")
+            else:
+                # GiftingLog column positions: 0=Timestamp 1=Recipient 2=Bags 3=Venue 4=Date
+                #                              5=LoggedBy 6=Notes 7=Posted 8=PostLink 9=ContentType
+                _opts = [
+                    f"{r['values'][0][1]} · {r['values'][0][3]} · {r['values'][0][4]}"
+                    for r in _results
+                ]
+                _sel_i = st.selectbox(
+                    "Select record to edit",
+                    range(len(_opts)),
+                    format_func=lambda i: _opts[i],
+                    key="g_sel_idx",
+                )
+                _row = _results[_sel_i]
+                _vals = _row["values"][0]
+                _row_index = _row["index"]
+
+                st.markdown("---")
+
+                # Read-only fields
+                st.text_input("Recipient", value=str(_vals[1]), disabled=True)
+                st.text_input("Venue", value=str(_vals[3]), disabled=True)
+                st.text_input("Content Type", value=str(_vals[9] or ""), disabled=True)
+
+                # Editable fields
+                _edit_bags = st.number_input(
+                    "Bags", min_value=0, step=1,
+                    value=max(0, int(_vals[2]) if str(_vals[2]).isdigit() else 0),
+                    key="g_edit_bags",
+                )
+                _edit_date_default = date.today()
+                try:
+                    _edit_date_default = dateparser.parse(str(_vals[4])).date()
+                except Exception:
+                    pass
+                _edit_date = st.date_input("Date", value=_edit_date_default, key="g_edit_date")
+
+                _lb_options = ["Kolton", "Cameron"]
+                _lb_idx = 1 if str(_vals[5]) == "Cameron" else 0
+                _edit_logged_by = st.radio(
+                    "Logged By", _lb_options, index=_lb_idx,
+                    horizontal=True, key="g_edit_logged_by",
+                )
+                _edit_notes = st.text_area(
+                    "Notes", value=str(_vals[6] or ""), height=80, key="g_edit_notes",
+                )
+                _edit_posted = st.checkbox(
+                    "They posted", value=(str(_vals[7]).strip().lower() == "yes"),
+                    key="g_edit_posted",
+                )
+                _edit_post_link = st.text_input(
+                    "Post Link", value=str(_vals[8] or ""), key="g_edit_post_link",
+                )
+                _edit_used_link = _edit_post_link.strip() if _edit_posted else ""
+                _edit_content_type = detect_content_type(_edit_used_link) if _edit_used_link else str(_vals[9] or "")
+                st.caption(f"Content type: {_edit_content_type or '(none)'}")
+
+                if st.button("Update Record →", key="g_update_btn"):
+                    _updated_row = [
+                        _vals[0],
+                        _vals[1],
+                        int(_edit_bags),
+                        _vals[3],
+                        _edit_date.isoformat(),
+                        _edit_logged_by,
+                        _edit_notes.strip(),
+                        "Yes" if _edit_posted else "No",
+                        _edit_used_link,
+                        _edit_content_type,
+                    ]
+                    with st.spinner("Updating SharePoint…"):
+                        ok = patch_row(
+                            st.secrets["GIFTING_FILE_ID"], "GiftingLog",
+                            _row_index, _updated_row,
+                        )
+                    if ok:
+                        st.session_state["g_success"] = (
+                            f"Updated: {_vals[1]} · {int(_edit_bags)} bags · {_edit_date.isoformat()}"
+                        )
+                        st.session_state["g_search_results"] = None
+                        st.rerun()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
