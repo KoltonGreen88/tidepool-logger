@@ -698,65 +698,136 @@ with event_tab:
     else:
         st.markdown("#### Post-Event Wrap-Up")
 
-        with st.spinner("Loading pre-logged events…"):
-            all_rows = get_table_rows(st.secrets["EVENTS_FILE_ID"], "EventLog")
+        post_mode = st.radio(
+            "Post-event type",
+            ["Select pre-logged event", "Log standalone post-event"],
+            horizontal=True,
+            key="post_mode_radio",
+            label_visibility="collapsed",
+        )
+        st.markdown("---")
 
-        # Row structure: [0]Timestamp [1]Venue [2]VenueType [3]EventDate
-        #   [4]BagsAllocated [5]LoggedBy [6]Sampled [7]Sold
-        #   [8]Leads [9]Followups [10]Notes [11]Status
-        pre_logged = []
-        for row_obj in all_rows:
-            vals = row_obj.get("values", [[]])[0] if row_obj.get("values") else []
-            if len(vals) > 11 and vals[11] == "Pre-logged":
-                pre_logged.append((row_obj.get("index", 0), vals))
+        # ── Sub-mode: Select pre-logged event (existing behaviour unchanged) ──
+        if post_mode == "Select pre-logged event":
 
-        if not pre_logged:
-            st.info("No pre-logged events yet. Switch to Pre-Event mode to log upcoming events.")
+            with st.spinner("Loading pre-logged events…"):
+                all_rows = get_table_rows(st.secrets["EVENTS_FILE_ID"], "EventLog")
+
+            # Row structure: [0]Timestamp [1]Venue [2]VenueType [3]EventDate
+            #   [4]BagsAllocated [5]LoggedBy [6]Sampled [7]Sold
+            #   [8]Leads [9]Followups [10]Notes [11]Status
+            pre_logged = []
+            for row_obj in all_rows:
+                vals = row_obj.get("values", [[]])[0] if row_obj.get("values") else []
+                if len(vals) > 11 and vals[11] == "Pre-logged":
+                    pre_logged.append((row_obj.get("index", 0), vals))
+
+            if not pre_logged:
+                st.info("No pre-logged events yet. Switch to Pre-Event mode to log upcoming events.")
+            else:
+                labels = [f"{v[1]} — {v[3]}" for _, v in pre_logged]
+                sel = st.selectbox(
+                    "Select Event *",
+                    range(len(labels)),
+                    format_func=lambda i: labels[i],
+                    key="post_event_selector",
+                )
+                row_index, row_vals = pre_logged[sel]
+
+                with st.form("post_event_form", clear_on_submit=True):
+                    sampled = st.number_input("Sampled", min_value=0, step=1, value=0)
+                    sold = st.number_input("Sold", min_value=0, step=1, value=0)
+                    leads = st.number_input("Leads", min_value=0, step=1, value=0)
+                    followups = st.number_input("Followups", min_value=0, step=1, value=0)
+                    post_notes = st.text_area(
+                        "Notes",
+                        placeholder="Event highlights, feedback, follow-ups needed…",
+                        height=100,
+                    )
+
+                    post_submit = st.form_submit_button("Complete Event →")
+
+                if post_submit:
+                    updated_row = [
+                        row_vals[0],         # Timestamp (original, preserve)
+                        row_vals[1],         # Venue
+                        row_vals[2],         # VenueType
+                        row_vals[3],         # EventDate
+                        row_vals[4],         # BagsAllocated
+                        row_vals[5],         # LoggedBy
+                        int(sampled),
+                        int(sold),
+                        int(leads),
+                        int(followups),
+                        post_notes.strip(),
+                        "Complete",
+                    ]
+                    with st.spinner("Updating SharePoint…"):
+                        ok = patch_row(st.secrets["EVENTS_FILE_ID"], "EventLog", row_index, updated_row)
+                    if ok:
+                        st.session_state["e_post_success"] = (
+                            f"Completed: {row_vals[1]} — {row_vals[3]}"
+                        )
+                        st.rerun()
+
+        # ── Sub-mode: Log standalone post-event ───────────────────────────────
         else:
-            labels = [f"{v[1]} — {v[3]}" for _, v in pre_logged]
-            sel = st.selectbox(
-                "Select Event *",
-                range(len(labels)),
-                format_func=lambda i: labels[i],
-                key="post_event_selector",
-            )
-            row_index, row_vals = pre_logged[sel]
-
-            with st.form("post_event_form", clear_on_submit=True):
-                sampled = st.number_input("Sampled", min_value=0, step=1, value=0)
-                sold = st.number_input("Sold", min_value=0, step=1, value=0)
-                leads = st.number_input("Leads", min_value=0, step=1, value=0)
-                followups = st.number_input("Followups", min_value=0, step=1, value=0)
-                post_notes = st.text_area(
+            _venue_type_opts = [
+                "Hotel/Luxury", "Wellness Studio", "Med Spa",
+                "Recovery/Sports", "Corporate", "Other",
+            ]
+            with st.form("standalone_post_event_form", clear_on_submit=True):
+                sp_venue = st.text_input("Venue *", placeholder="Studio, spa, hotel name")
+                sp_venue_type = st.selectbox("Venue Type *", _venue_type_opts)
+                sp_event_date = st.date_input("Event Date *", value=date.today())
+                sp_bags = st.number_input("Bags Allocated *", min_value=0, step=1, value=0)
+                sp_sampled = st.number_input("Sampled", min_value=0, step=1, value=0)
+                sp_sold = st.number_input("Sold", min_value=0, step=1, value=0)
+                sp_leads = st.number_input("Leads", min_value=0, step=1, value=0)
+                sp_followups = st.number_input("Followups", min_value=0, step=1, value=0)
+                sp_logged_by = st.radio(
+                    "Logged By *", ["Kolton", "Cameron"],
+                    horizontal=True, key="sp_logged_by",
+                )
+                sp_notes = st.text_area(
                     "Notes",
                     placeholder="Event highlights, feedback, follow-ups needed…",
                     height=100,
                 )
+                sp_submit = st.form_submit_button("Log Event →")
 
-                post_submit = st.form_submit_button("Complete Event →")
+            if sp_submit:
+                sp_errors = []
+                if not sp_venue.strip():
+                    sp_errors.append("Venue is required.")
+                if sp_bags <= 0:
+                    sp_errors.append("Bags Allocated must be at least 1.")
 
-            if post_submit:
-                updated_row = [
-                    row_vals[0],         # Timestamp (original, preserve)
-                    row_vals[1],         # Venue
-                    row_vals[2],         # VenueType
-                    row_vals[3],         # EventDate
-                    row_vals[4],         # BagsAllocated
-                    row_vals[5],         # LoggedBy
-                    int(sampled),
-                    int(sold),
-                    int(leads),
-                    int(followups),
-                    post_notes.strip(),
-                    "Complete",
-                ]
-                with st.spinner("Updating SharePoint…"):
-                    ok = patch_row(st.secrets["EVENTS_FILE_ID"], "EventLog", row_index, updated_row)
-                if ok:
-                    st.session_state["e_post_success"] = (
-                        f"Completed: {row_vals[1]} — {row_vals[3]}"
-                    )
-                    st.rerun()
+                if sp_errors:
+                    for err in sp_errors:
+                        st.error(err)
+                else:
+                    sp_row = [
+                        datetime.now().isoformat(timespec="seconds"),
+                        sp_venue.strip(),
+                        sp_venue_type,
+                        sp_event_date.isoformat(),
+                        int(sp_bags),
+                        sp_logged_by,
+                        int(sp_sampled),
+                        int(sp_sold),
+                        int(sp_leads),
+                        int(sp_followups),
+                        sp_notes.strip(),
+                        "Complete",
+                    ]
+                    with st.spinner("Saving to SharePoint…"):
+                        ok = append_row(st.secrets["EVENTS_FILE_ID"], "EventLog", sp_row)
+                    if ok:
+                        st.session_state["e_post_success"] = (
+                            f"Logged: {sp_venue.strip()} — {sp_event_date.isoformat()}"
+                        )
+                        st.rerun()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
