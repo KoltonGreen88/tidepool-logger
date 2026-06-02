@@ -1,6 +1,6 @@
 import json
 import time
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 import anthropic
 import requests
@@ -211,16 +211,16 @@ def _headers() -> dict:
     }
 
 
-def _table_base(file_id: str) -> str:
-    site_id = st.secrets["SHAREPOINT_SITE_ID"]
+def _table_base(file_id: str, site_id: str | None = None) -> str:
+    _site = site_id or st.secrets["SHAREPOINT_SITE_ID"]
     return (
-        f"https://graph.microsoft.com/v1.0/sites/{site_id}"
+        f"https://graph.microsoft.com/v1.0/sites/{_site}"
         f"/drive/items/{file_id}/workbook/tables"
     )
 
 
-def append_row(file_id: str, table_name: str, values: list) -> bool:
-    url = f"{_table_base(file_id)}/{table_name}/rows/add"
+def append_row(file_id: str, table_name: str, values: list, site_id: str | None = None) -> bool:
+    url = f"{_table_base(file_id, site_id)}/{table_name}/rows/add"
     try:
         resp = requests.post(url, headers=_headers(), json={"values": [values]}, timeout=20)
         if resp.status_code not in (200, 201):
@@ -315,6 +315,219 @@ def parse_with_ai(text: str) -> dict:
     return json.loads(raw)
 
 
+# ── Capture Review helpers ────────────────────────────────────────────────────
+
+def _strip_json(raw: str) -> str:
+    if "```" in raw:
+        parts = raw.split("```")
+        raw = parts[1] if len(parts) > 1 else raw
+        if raw.lower().startswith("json"):
+            raw = raw[4:].strip()
+    return raw.strip()
+
+
+def _fetch_granola_meetings() -> list | None:
+    key = st.secrets.get("GRANOLA_API_KEY", "paste-your-value-here")
+    if not key or key == "paste-your-value-here":
+        return None
+    created_after = (
+        (datetime.utcnow() - timedelta(days=30))
+        .strftime("%Y-%m-%dT%H:%M:%SZ")
+    )
+    try:
+        resp = requests.get(
+            "https://public-api.granola.ai/v1/notes",
+            headers={"Authorization": f"Bearer {key}", "Accept": "application/json"},
+            params={"created_after": created_after},
+            timeout=15,
+        )
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        notes = data.get("notes", [])
+        notes_sorted = sorted(notes, key=lambda n: n.get("created_at", ""), reverse=True)
+        result = []
+        for n in notes_sorted[:10]:
+            raw_date = n.get("created_at", "")
+            try:
+                parsed_dt = dateparser.parse(raw_date)
+                friendly_date = parsed_dt.strftime("%-d %b %Y") if parsed_dt else raw_date[:10]
+            except Exception:
+                friendly_date = raw_date[:10]
+            result.append({
+                "id": n.get("id", ""),
+                "title": n.get("title", "(untitled)"),
+                "date": friendly_date,
+            })
+        return result
+    except Exception:
+        return None
+
+
+def _fetch_granola_content(meeting_id: str) -> dict:
+    """Returns dict with keys: content, data_source, needs_review, review_reason."""
+    key = st.secrets.get("GRANOLA_API_KEY", "paste-your-value-here")
+    headers = {"Authorization": f"Bearer {key}", "Accept": "application/json"}
+    try:
+        resp = requests.get(
+            f"https://public-api.granola.ai/v1/notes/{meeting_id}",
+            headers=headers,
+            params={"include": "transcript"},
+            timeout=20,
+        )
+        if resp.status_code != 200:
+            return {"content": "", "data_source": "manual", "needs_review": True,
+                    "review_reason": f"Granola API returned {resp.status_code}"}
+        data = resp.json()
+        transcript_items = data.get("transcript") or []
+        if transcript_items:
+            lines = []
+            for item in transcript_items:
+                speaker = (
+                    item.get("speaker", {}).get("source")
+                    or item.get("diarization_label")
+                    or "Speaker"
+                )
+                text = item.get("text", "").strip()
+                if text:
+                    lines.append(f"{speaker}: {text}")
+            content = "\n".join(lines)
+            if content.strip():
+                return {"content": content, "data_source": "transcript",
+                        "needs_review": False, "review_reason": ""}
+        summary = data.get("summary") or data.get("notes") or ""
+        if summary:
+            return {
+                "content": summary,
+                "data_source": "summary",
+                "needs_review": True,
+                "review_reason": (
+                    "Extracted from AI summary not verbatim transcript - "
+                    "verify bags, pricing, and commitment details before confirming"
+                ),
+            }
+        return {"content": "", "data_source": "manual", "needs_review": True,
+                "review_reason": "No transcript or summary available for this note"}
+    except Exception as exc:
+        return {"content": "", "data_source": "manual", "needs_review": True,
+                "review_reason": f"Error fetching Granola content: {exc}"}
+
+
+def extract_meeting(content: str, data_source: str, meeting_type: str = "External Meeting") -> dict:
+    _sys = (
+        "You are the TIDEPOOL Capture Agent extracting structured meeting data for "
+        "SharePoint storage. TIDEPOOL is a glutathione and electrolyte recovery drink "
+        "mix brand based in Atlanta. Founded January 2026. DTC $24.99. B2B landed cost "
+        "$11.31. Wholesale tiers: Starter 12 bags $18.99, Growth 18 bags $17.49, Partner "
+        "24 bags $15.99. Target venues: medspas, recovery studios, wellness studios, "
+        "gyms, corporate accounts. Founders: Kolton Green (science/creative/medically "
+        "adjacent venues) and Cameron Kopp (relationship/sales/community venues). "
+        "Single shared Granola account - assigned_founder determined by transcript context "
+        "using personas above. Default to Kolton if unclear. "
+        f"This meeting is classified as: {meeting_type}. "
+        "Never invent data. Return null for any field not clearly present. "
+        "Never use em dashes. Return valid JSON only. No prose. No markdown."
+    )
+    _usr = (
+        "Extract meeting data and return JSON with these exact fields: "
+        "contact_name, contact_title, venue_name, "
+        "venue_type (one of: Medspa / Recovery Studio / Wellness Studio / Gym / "
+        "Corporate / Hotel / Event / Other), meeting_date (YYYY-MM-DD), "
+        "assigned_founder (Kolton or Cameron), "
+        "opportunity_type (one of: Wholesale / Gifting / Partnership / Event / "
+        "Investor / Press / Other), "
+        "bags_gifted (integer or null), bags_sold (integer or null), "
+        "revenue (dollar amount as string or null), "
+        "stage (one of: First Contact / Follow-up / Proposal Sent / Verbal Yes / "
+        "Closed / Pass), "
+        "key_insight (one sentence - most important outcome of this meeting), "
+        "follow_up_items (array of strings, each a specific action with owner if mentioned), "
+        "wholesale_potential (high / medium / low / null), "
+        "franchise_flag (true if franchise or multi-location ownership mentioned else false), "
+        "notes (anything important not captured above). "
+        "Wholesale potential: high = decision maker present + pricing discussed + interest; "
+        "medium = interested but gatekeeper or needs follow-up with owner; "
+        "low = casual interest, no decision maker, no next step. "
+        f"Meeting content: {content}"
+    )
+    ac = anthropic.Anthropic(api_key=st.secrets["ANTHROPIC_API_KEY"])
+    msg = ac.messages.create(
+        model="claude-sonnet-4-5",
+        max_tokens=2048,
+        system=_sys,
+        messages=[{"role": "user", "content": _usr}],
+    )
+    return json.loads(_strip_json(msg.content[0].text))
+
+
+def _transcribe_video(url: str) -> str | None:
+    endpoint = st.secrets.get("VIDEO_TRANSCRIPTION_URL", "paste-your-value-here")
+    if not endpoint or endpoint == "paste-your-value-here":
+        return None
+    try:
+        resp = requests.post(
+            endpoint,
+            json={"url": url},
+            timeout=60,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            return data.get("transcript") or data.get("text") or None
+        return None
+    except Exception:
+        return None
+
+
+def extract_video(transcript: str, url: str, platform: str, saved_by: str) -> dict:
+    _sys = (
+        "You are the TIDEPOOL Capture Agent extracting structured video idea data for "
+        "SharePoint storage. TIDEPOOL is a glutathione and electrolyte recovery drink "
+        "mix brand based in Atlanta. Founded January 2026. DTC $24.99. "
+        "Never invent data. Return null for any field not clearly present. "
+        "Never use em dashes. Return valid JSON only. No prose. No markdown."
+    )
+    _usr = (
+        "Extract video idea data and return JSON with these exact fields: "
+        f"source_url (use: {url}), "
+        f"platform (use: {platform}), "
+        "creator_handle (@handle if visible or null), "
+        "creator_name (full name if mentioned or null), "
+        "video_date (YYYY-MM-DD if determinable or null), "
+        f"saved_by (use: {saved_by}), "
+        "key_idea (one sentence - the core insight or concept most relevant to TIDEPOOL), "
+        "tidepool_relevance (one of: Product / Content / AI-Tools / Business / "
+        "Wholesale / Events / Gifting), "
+        "relevance_reasoning (one sentence - why this is relevant to TIDEPOOL specifically), "
+        "recommended_action (one of: SWIPE / ADAPT / REFERENCE / SHARE - "
+        "SWIPE=pure inspiration save for reference, ADAPT=take concept make it TIDEPOOL, "
+        "REFERENCE=cite or share internally, SHARE=repost or amplify as-is), "
+        "action_reasoning (one sentence - why this specific action), "
+        "content_hook (if tidepool_relevance is Content extract the hook or opening line "
+        "verbatim else null). "
+        f"Transcript: {transcript}"
+    )
+    ac = anthropic.Anthropic(api_key=st.secrets["ANTHROPIC_API_KEY"])
+    msg = ac.messages.create(
+        model="claude-sonnet-4-5",
+        max_tokens=1024,
+        system=_sys,
+        messages=[{"role": "user", "content": _usr}],
+    )
+    return json.loads(_strip_json(msg.content[0].text))
+
+
+def _get_pending_rows(file_id: str, table_name: str) -> list:
+    """Returns list of (row_index, values_list) for rows where status == 'pending'."""
+    rows = get_table_rows(file_id, table_name)
+    out = []
+    for r in rows:
+        vals = r.get("values", [[]])[0] if r.get("values") else []
+        idx = r.get("index", 0)
+        if vals and str(vals[-3]).lower() == "pending":
+            out.append((idx, vals))
+    return out
+
+
 # ── Session state defaults ────────────────────────────────────────────────────
 
 _DEFAULTS = {
@@ -330,6 +543,12 @@ _DEFAULTS = {
     "ca_gen": 0,
     "ca_logged_campaigns": set(),
     "g_search_results": None,
+    "cap_success": "",
+    "cap_gen": 0,
+    "cap_mtg_list": None,
+    "cap_mtg_extracted": None,
+    "cap_last_mtg_id": None,
+    "cap_vid_extracted": None,
 }
 for _k, _v in _DEFAULTS.items():
     if _k not in st.session_state:
@@ -382,7 +601,7 @@ st.markdown(
 )
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
-gifting_tab, event_tab, creator_tab = st.tabs(["Gifting Log", "Event Wrap-Up", "Creator Applications"])
+gifting_tab, event_tab, creator_tab, capture_tab = st.tabs(["Gifting Log", "Event Wrap-Up", "Creator Applications", "📥 Capture Review"])
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1253,3 +1472,454 @@ with creator_tab:
                                 st.session_state.pop(_key, None)
                             st.session_state["ca_gen"] += 1
                             st.rerun()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CAPTURE REVIEW TAB
+# ═══════════════════════════════════════════════════════════════════════════════
+with capture_tab:
+
+    if st.session_state["cap_success"]:
+        st.success(st.session_state["cap_success"])
+        st.session_state["cap_success"] = ""
+
+    st.markdown("### Capture Review")
+
+    _cgen = st.session_state["cap_gen"]
+
+    cap_mode = st.radio(
+        "Capture type",
+        ["Meeting Capture", "Video Idea"],
+        horizontal=True,
+        key="cap_mode_radio",
+        label_visibility="collapsed",
+    )
+    st.markdown("---")
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # MEETING CAPTURE
+    # ═══════════════════════════════════════════════════════════════════════
+    if cap_mode == "Meeting Capture":
+        st.markdown("#### Meeting Capture")
+
+        # ── Step 1: Meeting type + load or paste meeting content ──────────
+        _mtg_type_opts = ["External Meeting", "Founder Discussion", "Event Audio", "Other"]
+        _mtg_type = st.selectbox(
+            "Meeting Type",
+            _mtg_type_opts,
+            index=0,
+            key=f"cap_mtg_type_{_cgen}",
+        )
+
+        _mtg_list = st.session_state.get("cap_mtg_list")
+        _granola_configured = (
+            st.secrets.get("GRANOLA_API_KEY", "paste-your-value-here")
+            not in ("paste-your-value-here", "")
+        )
+
+        if _granola_configured:
+            if st.button("Load Recent Meetings from Granola →", key=f"cap_load_{_cgen}"):
+                with st.spinner("Fetching from Granola..."):
+                    _fetched = _fetch_granola_meetings()
+                st.session_state["cap_mtg_list"] = _fetched if _fetched is not None else []
+                st.rerun()
+
+        _show_paste = (not _granola_configured) or (_mtg_list is not None and len(_mtg_list) == 0)
+        _meeting_id = None
+        _meeting_meta = {}
+
+        if _mtg_list and not _show_paste:
+            # Granola dropdown
+            _mtg_opts = [f"{m.get('title','(untitled)')} — {m.get('date','')}" for m in _mtg_list]
+            _sel_i = st.selectbox(
+                "Select a recent meeting",
+                range(len(_mtg_opts)),
+                format_func=lambda i: _mtg_opts[i],
+                key=f"cap_mtg_sel_{_cgen}",
+            )
+            _meeting_id = _mtg_list[_sel_i].get("id")
+            _meeting_meta = _mtg_list[_sel_i]
+            _paste_content = ""
+            _manual_date = None
+
+            # Clear previous extraction when user switches to a different meeting
+            if _meeting_id != st.session_state.get("cap_last_mtg_id"):
+                st.session_state["cap_last_mtg_id"] = _meeting_id
+                st.session_state["cap_mtg_extracted"] = None
+        else:
+            if _granola_configured and _mtg_list is not None:
+                st.info("No recent meetings found in Granola.")
+            st.markdown("**Paste meeting content:**")
+            _paste_content = st.text_area(
+                "Transcript or summary",
+                height=200,
+                placeholder="Paste Granola export, transcript, or meeting notes here...",
+                key=f"cap_mtg_paste_{_cgen}",
+            )
+            _manual_date = st.date_input("Meeting date", value=date.today(), key=f"cap_mtg_date_{_cgen}")
+
+        # ── Step 2: Extract ────────────────────────────────────────────────
+        if st.button("Extract with AI →", key=f"cap_mtg_extract_{_cgen}"):
+            _content = ""
+            _data_source = "manual"
+            _needs_review = False
+            _review_reason = ""
+
+            if _meeting_id:
+                with st.spinner("Fetching transcript..."):
+                    _gc = _fetch_granola_content(_meeting_id)
+                    _content = _gc["content"]
+                    _data_source = _gc["data_source"]
+                    _needs_review = _gc["needs_review"]
+                    _review_reason = _gc["review_reason"]
+                if not _content:
+                    st.error("Could not retrieve meeting content from Granola. Paste content manually below.")
+                    st.stop()
+            else:
+                _content = _paste_content.strip()
+                _data_source = "manual"
+                _needs_review = True
+                _review_reason = "Manually pasted content - verify all fields"
+
+            if not _content:
+                st.warning("No meeting content to extract from.")
+            else:
+                with st.spinner("Extracting fields..."):
+                    try:
+                        _extracted = extract_meeting(_content, _data_source, _mtg_type)
+                        _extracted["data_source"] = _data_source
+                        _extracted["meeting_type"] = _mtg_type
+                        _extracted["needs_review"] = _needs_review
+                        _extracted["review_reason"] = _review_reason
+                        _extracted["status"] = "pending"
+                        _extracted["timestamp"] = datetime.now().isoformat(timespec="seconds")
+                        if _manual_date and not _extracted.get("meeting_date"):
+                            _extracted["meeting_date"] = _manual_date.isoformat()
+                        st.session_state["cap_mtg_extracted"] = _extracted
+                        st.rerun()
+                    except json.JSONDecodeError as _je:
+                        st.error(f"Extraction parse error: {_je}")
+                    except Exception as _exc:
+                        st.error(f"Extraction failed: {_exc}")
+
+        # ── Step 3: Confirm card ───────────────────────────────────────────
+        _mtg_ext = st.session_state.get("cap_mtg_extracted")
+
+        if _mtg_ext:
+            _nr = _mtg_ext.get("needs_review", False)
+            if _nr:
+                st.markdown(
+                    '<div style="background:#D85A30; border-radius:8px; padding:10px 16px; '
+                    'margin-bottom:12px; color:white; font-size:14px; font-weight:600;">'
+                    "⚠ Some fields may need verification — extracted from summary, not full transcript"
+                    "</div>",
+                    unsafe_allow_html=True,
+                )
+            st.markdown("**MEETING CAPTURE — Review & Confirm**")
+            st.caption(
+                f"Contact: {_mtg_ext.get('contact_name','—')} · {_mtg_ext.get('venue_name','—')} | "
+                f"Meeting: {_mtg_ext.get('meeting_type','—')} | "
+                f"Type: {_mtg_ext.get('opportunity_type','—')} | "
+                f"Assigned: {_mtg_ext.get('assigned_founder','—')} | "
+                f"Follow-ups: {len(_mtg_ext.get('follow_up_items') or [])} items"
+            )
+
+            with st.expander("Edit all fields"):
+                _mtg_ext["contact_name"] = st.text_input("Contact Name", value=str(_mtg_ext.get("contact_name") or ""), key=f"ce_cn_{_cgen}")
+                _mtg_ext["contact_title"] = st.text_input("Contact Title", value=str(_mtg_ext.get("contact_title") or ""), key=f"ce_ct_{_cgen}")
+                _mtg_ext["venue_name"] = st.text_input("Venue Name", value=str(_mtg_ext.get("venue_name") or ""), key=f"ce_vn_{_cgen}")
+                _vt_opts = ["Medspa", "Recovery Studio", "Wellness Studio", "Gym", "Corporate", "Hotel", "Event", "Other"]
+                _vt_cur = _mtg_ext.get("venue_type", "Other")
+                _vt_idx = _vt_opts.index(_vt_cur) if _vt_cur in _vt_opts else len(_vt_opts) - 1
+                _mtg_ext["venue_type"] = st.selectbox("Venue Type", _vt_opts, index=_vt_idx, key=f"ce_vtype_{_cgen}")
+                _md_val = date.today()
+                try:
+                    _md_val = dateparser.parse(str(_mtg_ext.get("meeting_date",""))).date()
+                except Exception:
+                    pass
+                _mtg_ext["meeting_date"] = st.date_input("Meeting Date", value=_md_val, key=f"ce_md_{_cgen}").isoformat()
+                _af_opts = ["Kolton", "Cameron"]
+                _af_idx = 1 if _mtg_ext.get("assigned_founder") == "Cameron" else 0
+                _mtg_ext["assigned_founder"] = st.radio("Assigned Founder", _af_opts, index=_af_idx, horizontal=True, key=f"ce_af_{_cgen}")
+                _ot_opts = ["Wholesale", "Gifting", "Partnership", "Event", "Investor", "Press", "Other"]
+                _ot_cur = _mtg_ext.get("opportunity_type", "Other")
+                _ot_idx = _ot_opts.index(_ot_cur) if _ot_cur in _ot_opts else len(_ot_opts) - 1
+                _mtg_ext["opportunity_type"] = st.selectbox("Opportunity Type", _ot_opts, index=_ot_idx, key=f"ce_ot_{_cgen}")
+                _mtg_ext["bags_gifted"] = st.number_input("Bags Gifted", min_value=0, step=1, value=int(_mtg_ext.get("bags_gifted") or 0), key=f"ce_bg_{_cgen}")
+                _mtg_ext["bags_sold"] = st.number_input("Bags Sold", min_value=0, step=1, value=int(_mtg_ext.get("bags_sold") or 0), key=f"ce_bs_{_cgen}")
+                _mtg_ext["revenue"] = st.text_input("Revenue", value=str(_mtg_ext.get("revenue") or ""), key=f"ce_rev_{_cgen}")
+                _st_opts = ["First Contact", "Follow-up", "Proposal Sent", "Verbal Yes", "Closed", "Pass"]
+                _st_cur = _mtg_ext.get("stage", "First Contact")
+                _st_idx = _st_opts.index(_st_cur) if _st_cur in _st_opts else 0
+                _mtg_ext["stage"] = st.selectbox("Stage", _st_opts, index=_st_idx, key=f"ce_stage_{_cgen}")
+                _mtg_ext["key_insight"] = st.text_area("Key Insight", value=str(_mtg_ext.get("key_insight") or ""), height=80, key=f"ce_ki_{_cgen}")
+                _fu_raw = "\n".join(_mtg_ext.get("follow_up_items") or [])
+                _fu_edited = st.text_area("Follow-up Items (one per line)", value=_fu_raw, height=100, key=f"ce_fu_{_cgen}")
+                _mtg_ext["follow_up_items"] = [l.strip() for l in _fu_edited.splitlines() if l.strip()]
+                _wp_opts = ["high", "medium", "low", "null"]
+                _wp_cur = str(_mtg_ext.get("wholesale_potential") or "null")
+                _wp_idx = _wp_opts.index(_wp_cur) if _wp_cur in _wp_opts else 3
+                _mtg_ext["wholesale_potential"] = st.selectbox("Wholesale Potential", _wp_opts, index=_wp_idx, key=f"ce_wp_{_cgen}")
+                _mtg_ext["franchise_flag"] = st.checkbox("Franchise / Multi-location flag", value=bool(_mtg_ext.get("franchise_flag")), key=f"ce_ff_{_cgen}")
+                _mtg_ext["notes"] = st.text_area("Notes", value=str(_mtg_ext.get("notes") or ""), height=80, key=f"ce_notes_{_cgen}")
+                _lb_opts = ["Kolton", "Cameron"]
+                _lb_idx = 1 if _mtg_ext.get("logged_by") == "Cameron" else 0
+                _mtg_ext["logged_by"] = st.radio("Logged By", _lb_opts, index=_lb_idx, horizontal=True, key=f"ce_lb_{_cgen}")
+
+            if st.button("Log to SharePoint →", key=f"cap_mtg_log_{_cgen}"):
+                _fu_str = "; ".join(_mtg_ext.get("follow_up_items") or [])
+                _mtg_row = [
+                    _mtg_ext.get("timestamp", datetime.now().isoformat(timespec="seconds")),
+                    str(_mtg_ext.get("meeting_type") or ""),
+                    str(_mtg_ext.get("contact_name") or ""),
+                    str(_mtg_ext.get("contact_title") or ""),
+                    str(_mtg_ext.get("venue_name") or ""),
+                    str(_mtg_ext.get("venue_type") or ""),
+                    str(_mtg_ext.get("meeting_date") or ""),
+                    str(_mtg_ext.get("assigned_founder") or ""),
+                    str(_mtg_ext.get("opportunity_type") or ""),
+                    _mtg_ext.get("bags_gifted") or 0,
+                    _mtg_ext.get("bags_sold") or 0,
+                    str(_mtg_ext.get("revenue") or ""),
+                    str(_mtg_ext.get("stage") or ""),
+                    str(_mtg_ext.get("key_insight") or ""),
+                    _fu_str,
+                    str(_mtg_ext.get("wholesale_potential") or ""),
+                    str(_mtg_ext.get("franchise_flag", False)),
+                    str(_mtg_ext.get("notes") or ""),
+                    str(_mtg_ext.get("data_source") or ""),
+                    str(_mtg_ext.get("needs_review", False)),
+                    str(_mtg_ext.get("review_reason") or ""),
+                    "pending",
+                    str(_mtg_ext.get("logged_by") or "Kolton"),
+                ]
+                with st.spinner("Saving to SharePoint..."):
+                    _ok = append_row(st.secrets["MEETINGS_FILE_ID"], "MeetingLog", _mtg_row,
+                                    site_id=st.secrets["STRATEGY_SITE_ID"])
+                if _ok:
+                    st.session_state["cap_success"] = (
+                        f"Meeting captured: {_mtg_ext.get('contact_name','—')} - "
+                        f"{_mtg_ext.get('venue_name','—')} (pending confirmation)"
+                    )
+                    st.session_state["cap_mtg_extracted"] = None
+                    st.session_state["cap_mtg_list"] = None
+                    st.session_state["cap_gen"] += 1
+                    st.rerun()
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # VIDEO IDEA CAPTURE
+    # ═══════════════════════════════════════════════════════════════════════
+    else:
+        st.markdown("#### Video Idea Capture")
+
+        _vid_url = st.text_input(
+            "Paste video URL",
+            placeholder="https://www.tiktok.com/@handle/video/...",
+            key=f"cap_vid_url_{_cgen}",
+        )
+        _vid_saved_by = st.radio("Saved by", ["Kolton", "Cameron"], horizontal=True, key=f"cap_vid_sb_{_cgen}")
+
+        def _detect_platform(url: str) -> str:
+            u = url.lower()
+            if "tiktok.com" in u:
+                return "TikTok"
+            if "instagram.com" in u:
+                return "Instagram"
+            if "youtube.com" in u or "youtu.be" in u:
+                return "YouTube"
+            return "Other"
+
+        _vid_platform = _detect_platform(_vid_url) if _vid_url else ""
+        if _vid_platform:
+            st.caption(f"Platform detected: {_vid_platform}")
+
+        _show_manual_transcript = st.session_state.get("cap_vid_show_paste", False)
+        _manual_transcript = ""
+        if _show_manual_transcript:
+            st.warning("Could not transcribe this video. Paste transcript manually below.")
+            _manual_transcript = st.text_area(
+                "Paste transcript or caption text",
+                height=200,
+                key=f"cap_vid_paste_{_cgen}",
+            )
+
+        if st.button("Extract with AI →", key=f"cap_vid_extract_{_cgen}"):
+            if not _vid_url.strip():
+                st.warning("Paste a video URL first.")
+            else:
+                _transcript = None
+                if not _show_manual_transcript:
+                    with st.spinner("Fetching transcript..."):
+                        _transcript = _transcribe_video(_vid_url.strip())
+                    if _transcript is None:
+                        st.session_state["cap_vid_show_paste"] = True
+                        st.rerun()
+
+                _transcript_text = _transcript or _manual_transcript
+                if not _transcript_text.strip():
+                    st.warning("No transcript content to extract from.")
+                else:
+                    with st.spinner("Extracting fields..."):
+                        try:
+                            _vext = extract_video(
+                                _transcript_text, _vid_url.strip(),
+                                _vid_platform, _vid_saved_by,
+                            )
+                            _vext["status"] = "pending"
+                            _vext["timestamp"] = datetime.now().isoformat(timespec="seconds")
+                            st.session_state["cap_vid_extracted"] = _vext
+                            st.session_state["cap_vid_show_paste"] = False
+                            st.rerun()
+                        except json.JSONDecodeError as _je:
+                            st.error(f"Extraction parse error: {_je}")
+                        except Exception as _exc:
+                            st.error(f"Extraction failed: {_exc}")
+
+        _vid_ext = st.session_state.get("cap_vid_extracted")
+
+        if _vid_ext:
+            _act_colors = {"SWIPE": "#5B6FA8", "ADAPT": "#1D9E75", "REFERENCE": "#E8C94A", "SHARE": "#D85A30"}
+            _act = str(_vid_ext.get("recommended_action", "SWIPE"))
+            _act_color = _act_colors.get(_act, "#5B6FA8")
+            st.markdown(
+                f"""
+                <div style="background:#243350; border-left:4px solid {_act_color};
+                            border-radius:10px; padding:16px; margin-bottom:12px;">
+                    <div style="font-family:'Barlow Condensed',sans-serif; font-size:13px;
+                                font-weight:700; color:#8090b0; text-transform:uppercase;
+                                letter-spacing:1px; margin-bottom:8px;">VIDEO CAPTURE</div>
+                    <div style="color:#E8C94A; font-size:16px; font-weight:700;
+                                margin-bottom:4px;">{_vid_ext.get('platform','')}: {_vid_ext.get('creator_handle') or _vid_url[:40]}</div>
+                    <div style="color:#E8EAF0; font-size:14px; margin-bottom:4px;">
+                        {_vid_ext.get('key_idea','')}</div>
+                    <div style="color:#8090b0; font-size:13px; margin-bottom:8px;">
+                        {_vid_ext.get('tidepool_relevance','')} · Saved by {_vid_ext.get('saved_by','')}</div>
+                    <span style="background:{_act_color}; color:white; padding:3px 10px;
+                                 border-radius:4px; font-size:12px; font-weight:700;">
+                        {_act}</span>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+            with st.expander("Edit all fields"):
+                _vid_ext["creator_handle"] = st.text_input("Creator Handle", value=str(_vid_ext.get("creator_handle") or ""), key=f"ve_ch_{_cgen}")
+                _vid_ext["creator_name"] = st.text_input("Creator Name", value=str(_vid_ext.get("creator_name") or ""), key=f"ve_cnm_{_cgen}")
+                _rel_opts = ["Product", "Content", "AI-Tools", "Business", "Wholesale", "Events", "Gifting"]
+                _rel_cur = _vid_ext.get("tidepool_relevance", "Content")
+                _rel_idx = _rel_opts.index(_rel_cur) if _rel_cur in _rel_opts else 0
+                _vid_ext["tidepool_relevance"] = st.selectbox("TIDEPOOL Relevance", _rel_opts, index=_rel_idx, key=f"ve_rel_{_cgen}")
+                _vid_ext["key_idea"] = st.text_area("Key Idea", value=str(_vid_ext.get("key_idea") or ""), height=80, key=f"ve_ki_{_cgen}")
+                _vid_ext["relevance_reasoning"] = st.text_area("Relevance Reasoning", value=str(_vid_ext.get("relevance_reasoning") or ""), height=60, key=f"ve_rr_{_cgen}")
+                _ra_opts = ["SWIPE", "ADAPT", "REFERENCE", "SHARE"]
+                _ra_cur = _vid_ext.get("recommended_action", "SWIPE")
+                _ra_idx = _ra_opts.index(_ra_cur) if _ra_cur in _ra_opts else 0
+                _vid_ext["recommended_action"] = st.selectbox("Recommended Action", _ra_opts, index=_ra_idx, key=f"ve_ra_{_cgen}")
+                _vid_ext["action_reasoning"] = st.text_area("Action Reasoning", value=str(_vid_ext.get("action_reasoning") or ""), height=60, key=f"ve_ar_{_cgen}")
+                _vid_ext["content_hook"] = st.text_input("Content Hook", value=str(_vid_ext.get("content_hook") or ""), key=f"ve_hook_{_cgen}")
+
+            if st.button("Log to SharePoint →", key=f"cap_vid_log_{_cgen}"):
+                _vid_row = [
+                    str(_vid_ext.get("source_url") or ""),
+                    str(_vid_ext.get("platform") or ""),
+                    str(_vid_ext.get("creator_handle") or ""),
+                    str(_vid_ext.get("creator_name") or ""),
+                    str(_vid_ext.get("video_date") or ""),
+                    str(_vid_ext.get("saved_by") or ""),
+                    str(_vid_ext.get("key_idea") or ""),
+                    str(_vid_ext.get("tidepool_relevance") or ""),
+                    str(_vid_ext.get("relevance_reasoning") or ""),
+                    str(_vid_ext.get("recommended_action") or ""),
+                    str(_vid_ext.get("action_reasoning") or ""),
+                    str(_vid_ext.get("content_hook") or ""),
+                    "pending",
+                    _vid_ext.get("timestamp", datetime.now().isoformat(timespec="seconds")),
+                    str(_vid_ext.get("saved_by") or "Kolton"),
+                ]
+                with st.spinner("Saving to SharePoint..."):
+                    _ok = append_row(st.secrets["VIDEO_FILE_ID"], "VideoIdeas", _vid_row,
+                                    site_id=st.secrets["STRATEGY_SITE_ID"])
+                if _ok:
+                    st.session_state["cap_success"] = (
+                        f"Video captured: {_vid_ext.get('platform','')} - "
+                        f"{_vid_ext.get('creator_handle') or 'unknown'} (pending confirmation)"
+                    )
+                    st.session_state["cap_vid_extracted"] = None
+                    st.session_state["cap_vid_show_paste"] = False
+                    st.session_state["cap_gen"] += 1
+                    st.rerun()
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # PENDING QUEUE
+    # ═══════════════════════════════════════════════════════════════════════
+    st.markdown("---")
+    st.markdown("#### Pending Queue")
+
+    _mtg_pending = []
+    _vid_pending = []
+    _mtg_fid = st.secrets.get("MEETINGS_FILE_ID", "paste-your-value-here")
+    _vid_fid = st.secrets.get("VIDEO_FILE_ID", "paste-your-value-here")
+
+    if _mtg_fid not in ("paste-your-value-here", ""):
+        with st.spinner("Loading pending captures..."):
+            _mtg_pending = _get_pending_rows(_mtg_fid, "MeetingLog")
+    if _vid_fid not in ("paste-your-value-here", ""):
+        _vid_pending = _get_pending_rows(_vid_fid, "VideoIdeas")
+
+    _all_pending = (
+        [("meeting", ri, v) for ri, v in _mtg_pending] +
+        [("video", ri, v) for ri, v in _vid_pending]
+    )
+    _all_pending.sort(key=lambda x: x[2][-2] if len(x[2]) >= 2 else "", reverse=True)
+
+    if not _all_pending:
+        st.caption("No pending captures. All confirmed.")
+    else:
+        st.caption(f"{len(_all_pending)} pending capture(s) awaiting confirmation.")
+
+        if st.button("Confirm All →", key="cap_confirm_all"):
+            _errs = 0
+            for _ptype, _ri, _pvals in _all_pending:
+                _new_vals = list(_pvals)
+                _new_vals[-3] = "confirmed"
+                _fid = _mtg_fid if _ptype == "meeting" else _vid_fid
+                _tbl = "MeetingLog" if _ptype == "meeting" else "VideoIdeas"
+                if not patch_row(_fid, _tbl, _ri, _new_vals):
+                    _errs += 1
+            if _errs == 0:
+                st.session_state["cap_success"] = f"Confirmed {len(_all_pending)} captures."
+            else:
+                st.warning(f"{_errs} error(s) during batch confirm.")
+            st.rerun()
+
+        for _ptype, _ri, _pvals in _all_pending:
+            if _ptype == "meeting":
+                _icon = "🤝"
+                _label = f"{_pvals[0] or '—'} · {_pvals[2] or '—'} · {_pvals[4] or '—'}"
+                _sub = f"Assigned: {_pvals[5] or '—'}"
+                _fid = _mtg_fid
+                _tbl = "MeetingLog"
+            else:
+                _icon = "🎬"
+                _label = f"{_pvals[1] or '—'}: {_pvals[2] or _pvals[0][:30] or '—'}"
+                _sub = f"Action: {_pvals[9] or '—'} · Saved by: {_pvals[5] or '—'}"
+                _fid = _vid_fid
+                _tbl = "VideoIdeas"
+
+            _pc1, _pc2, _pc3 = st.columns([5, 1, 1])
+            with _pc1:
+                st.markdown(f"**{_icon} {_label}**  \n{_sub}")
+            with _pc2:
+                if st.button("Confirm", key=f"cap_conf_{_ptype}_{_ri}"):
+                    _new_vals = list(_pvals)
+                    _new_vals[-3] = "confirmed"
+                    with st.spinner("Confirming..."):
+                        patch_row(_fid, _tbl, _ri, _new_vals)
+                    st.rerun()
+            with _pc3:
+                if st.button("Discard", key=f"cap_disc_{_ptype}_{_ri}"):
+                    _new_vals = list(_pvals)
+                    _new_vals[-3] = "discarded"
+                    with st.spinner("Discarding..."):
+                        patch_row(_fid, _tbl, _ri, _new_vals)
+                    st.rerun()

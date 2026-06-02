@@ -239,6 +239,37 @@ CREATOR_FILE_ID = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 
 Also add it to the **Secrets** panel in Streamlit Cloud when deploying.
 
+### 2.4 TIDEPOOL_Meetings.xlsx
+
+Create a fourth Excel file for the Capture Review — Meeting Capture tab.
+
+1. In SharePoint, create a new Excel workbook named `TIDEPOOL_Meetings`
+2. Open it → **Edit in Excel for the web** → **Insert → Table**
+3. **Table Design** → set **Table Name** to exactly: `MeetingLog`
+4. Set these column headers in row 1, in this exact order:
+
+```
+Timestamp | MeetingType | ContactName | ContactTitle | VenueName | VenueType | MeetingDate | AssignedFounder | OpportunityType | BagsGifted | BagsSold | Revenue | Stage | KeyInsight | FollowUpItems | WholesalePotential | FranchiseFlag | Notes | DataSource | NeedsReview | ReviewReason | Status | LoggedBy
+```
+
+> **Note:** `MeetingType` is column B (second column). Values: `External Meeting`, `Founder Discussion`, `Event Audio`, `Other`.
+
+Paste the file ID into `secrets.toml` as `MEETINGS_FILE_ID`.
+
+### 2.5 TIDEPOOL_VideoIdeas.xlsx
+
+Create a fifth Excel file for the Capture Review — Video Idea tab.
+
+1. Create a new Excel workbook named `TIDEPOOL_VideoIdeas`
+2. **Table Name**: `VideoIdeas`
+3. Column headers in order:
+
+```
+SourceUrl | Platform | CreatorHandle | CreatorName | VideoDate | SavedBy | KeyIdea | TidepoolRelevance | RelevanceReasoning | RecommendedAction | ActionReasoning | ContentHook | Status | Timestamp | LoggedBy
+```
+
+Paste the file ID into `secrets.toml` as `VIDEO_FILE_ID`.
+
 ---
 
 ## Troubleshooting
