@@ -2081,7 +2081,10 @@ with finance_tab:
             _m = _txn_re.match(_line.strip())
             if not _m:
                 continue
-            _date = _m.group(1)
+            try:
+                _date = datetime.strptime(_m.group(1), "%m/%d/%y").strftime("%Y-%m-%d")
+            except ValueError:
+                _date = _m.group(1)
             _desc = _m.group(2).strip()
             _amt = float(_m.group(3).replace(',', ''))
             _typ = "Credit" if _amt >= 0 else "Debit"
@@ -2242,6 +2245,14 @@ with finance_tab:
 
             _fin_logger = st.radio("Logged by", ["Kolton", "Cameron"], horizontal=True, key="fin_logged_by")
 
+            st.session_state["finance_debug"] = (
+                f"FINANCE_SITE_ID={_fin_sid!r} | "
+                f"FINANCE_FILE_ID={_fin_fid!r} | "
+                f"FINANCE_SUMMARY_FILE_ID={_fin_sum_fid!r} | "
+                f"tables: FinanceLog, FinanceSummary"
+            )
+            st.write(st.session_state.get("finance_debug", ""))
+
             if st.button("Submit for Approval →", key="fin_submit_btn"):
                 if not _fin_fid:
                     st.error("FINANCE_FILE_ID not configured in secrets.")
@@ -2268,10 +2279,10 @@ with finance_tab:
                                 "pending_approval",
                                 str(_row["Notes"]),
                             ]
-                            if not append_row(_fin_fid, "TIDEPOOL_Finance", _txn_vals, site_id=_fin_sid):
+                            if not append_row(_fin_fid, "FinanceLog", _txn_vals, site_id=_fin_sid):
                                 _errs += 1
                         if _fin_sum_fid:
-                            append_row(_fin_sum_fid, "TIDEPOOL_Finance_Summary", [
+                            append_row(_fin_sum_fid, "FinanceSummary", [
                                 _ts, _month,
                                 _fin_parsed["beginning_balance"],
                                 _fin_parsed["ending_balance"],
@@ -2279,9 +2290,8 @@ with finance_tab:
                                 len(_fin_cats), _fin_logger, "pending_approval",
                             ], site_id=_fin_sid)
                     if _errs == 0:
-                        st.success(
-                            f"Submitted: {_month} — {len(_fin_cats)} transactions pending Cameron approval"
-                        )
+                        st.success(f"Submitted: {_month} — {len(_fin_cats)} transactions pending approval")
+                        st.balloons()
                         st.session_state["fin_parsed"] = None
                         st.session_state["fin_categorized"] = None
                         st.rerun()
@@ -2295,7 +2305,7 @@ with finance_tab:
     if not _fin_fid:
         st.caption("FINANCE_FILE_ID not configured.")
     else:
-        _fin_all_rows = _fin_get_rows("TIDEPOOL_Finance")
+        _fin_all_rows = _fin_get_rows("FinanceLog")
         # Column order: Timestamp(0) StatementMonth(1) Date(2) Description(3)
         # Amount(4) Type(5) Category(6) Confidence(7) LoggedBy(8) ApprovedBy(9) Status(10) Notes(11)
         _fin_pending = [
@@ -2343,7 +2353,7 @@ with finance_tab:
                             if len(_new_vals) > 10:
                                 _new_vals[9] = _fin_approver
                                 _new_vals[10] = "approved"
-                            if not _fin_patch_row("TIDEPOOL_Finance", _ri, _new_vals):
+                            if not _fin_patch_row("FinanceLog", _ri, _new_vals):
                                 _ap_errs += 1
                     if _ap_errs == 0:
                         st.success(f"Approved {len(_month_rows)} transactions for {_month}.")
