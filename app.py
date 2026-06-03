@@ -1,5 +1,6 @@
 import json
 import time
+import traceback
 from datetime import date, datetime, timedelta
 
 import anthropic
@@ -460,21 +461,66 @@ def extract_meeting(content: str, data_source: str, meeting_type: str = "Externa
     return json.loads(_strip_json(msg.content[0].text))
 
 
-def _transcribe_video(url: str) -> str | None:
-    endpoint = st.secrets.get("VIDEO_TRANSCRIPTION_URL", "paste-your-value-here")
-    if not endpoint or endpoint == "paste-your-value-here":
-        return None
+def _transcribe_video_mcp(url: str) -> dict | None:
+    u = url.lower()
+    if "tiktok.com" in u:
+        _tool = "get_tiktok_transcript"
+        _platform = "TikTok"
+    elif "instagram.com" in u:
+        _tool = "get_instagram_transcript"
+        _platform = "Instagram"
+    elif "youtube.com" in u or "youtu.be" in u:
+        _tool = "get_youtube_transcript"
+        _platform = "YouTube"
+    else:
+        _tool = "get_tiktok_transcript"
+        _platform = "Other"
     try:
-        resp = requests.post(
-            endpoint,
-            json={"url": url},
+        _resp = requests.post(
+            "https://api.tokscript.com/mcp",
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json, text/event-stream",
+                "Authorization": "Bearer " + st.secrets.get("TOKSCRIPT_API_KEY", ""),
+            },
+            json={
+                "jsonrpc": "2.0",
+                "method": "tools/call",
+                "params": {"name": _tool, "arguments": {"video_url": url, "format": "text"}},
+                "id": 1,
+            },
             timeout=60,
+            stream=True,
         )
-        if resp.status_code == 200:
-            data = resp.json()
-            return data.get("transcript") or data.get("text") or None
-        return None
+        _result = None
+        _first_data = None
+        for _line in _resp.iter_lines():
+            if isinstance(_line, bytes):
+                _line = _line.decode("utf-8")
+            if not _line.startswith("data:"):
+                continue
+            _raw_chunk = _line[len("data:"):].strip()
+            if _first_data is None:
+                _first_data = _raw_chunk
+                st.session_state["video_mcp_raw"] = _raw_chunk
+            _parsed = json.loads(_raw_chunk)
+            if "result" in _parsed:
+                _result = _parsed["result"]
+                break
+        if _result is None:
+            return None
+        _data = json.loads(_result["content"][0]["text"])
+        _pub = _data.get("publishDate") or ""
+        return {
+            "transcript": _data.get("transcript") or "",
+            "creator_handle": (_data.get("author") or {}).get("username") or None,
+            "creator_name": (_data.get("author") or {}).get("displayName") or None,
+            "video_date": _pub[:10] if _pub else None,
+            "platform": _platform,
+            "title": _data.get("title") or None,
+        }
     except Exception:
+        st.session_state["video_mcp_debug"] = traceback.format_exc()
         return None
 
 
@@ -503,7 +549,9 @@ def extract_video(transcript: str, url: str, platform: str, saved_by: str) -> di
         "REFERENCE=cite or share internally, SHARE=repost or amplify as-is), "
         "action_reasoning (one sentence - why this specific action), "
         "content_hook (if tidepool_relevance is Content extract the hook or opening line "
-        "verbatim else null). "
+        "verbatim else null), "
+        "tactical_takeaway (one sentence on what TIDEPOOL could directly steal or adapt from "
+        "this video — specific and actionable, not generic). "
         f"Transcript: {transcript}"
     )
     ac = anthropic.Anthropic(api_key=st.secrets["ANTHROPIC_API_KEY"])
@@ -1737,6 +1785,8 @@ with capture_tab:
         _manual_transcript = ""
         if _show_manual_transcript:
             st.warning("Could not transcribe this video. Paste transcript manually below.")
+            st.write("DEBUG RAW:", st.session_state.get("video_mcp_raw", "empty"))
+            st.write("DEBUG ERROR:", st.session_state.get("video_mcp_debug", "empty"))
             _manual_transcript = st.text_area(
                 "Paste transcript or caption text",
                 height=200,
@@ -1747,13 +1797,16 @@ with capture_tab:
             if not _vid_url.strip():
                 st.warning("Paste a video URL first.")
             else:
+                _mcp_data = None
                 _transcript = None
                 if not _show_manual_transcript:
                     with st.spinner("Fetching transcript..."):
-                        _transcript = _transcribe_video(_vid_url.strip())
-                    if _transcript is None:
+                        _mcp_data = _transcribe_video_mcp(_vid_url.strip())
+                    if _mcp_data is None:
                         st.session_state["cap_vid_show_paste"] = True
                         st.rerun()
+                    else:
+                        _transcript = _mcp_data.get("transcript")
 
                 _transcript_text = _transcript or _manual_transcript
                 if not _transcript_text.strip():
@@ -1765,6 +1818,10 @@ with capture_tab:
                                 _transcript_text, _vid_url.strip(),
                                 _vid_platform, _vid_saved_by,
                             )
+                            if _mcp_data:
+                                for _k in ("creator_handle", "creator_name", "video_date", "platform"):
+                                    if _mcp_data.get(_k):
+                                        _vext[_k] = _mcp_data[_k]
                             _vext["status"] = "pending"
                             _vext["timestamp"] = datetime.now().isoformat(timespec="seconds")
                             st.session_state["cap_vid_extracted"] = _vext
@@ -1832,6 +1889,7 @@ with capture_tab:
                     str(_vid_ext.get("recommended_action") or ""),
                     str(_vid_ext.get("action_reasoning") or ""),
                     str(_vid_ext.get("content_hook") or ""),
+                    str(_vid_ext.get("tactical_takeaway") or ""),
                     "pending",
                     _vid_ext.get("timestamp", datetime.now().isoformat(timespec="seconds")),
                     str(_vid_ext.get("saved_by") or "Kolton"),
