@@ -1,12 +1,20 @@
 import json
 import time
 import traceback
-from datetime import date, datetime, timedelta
+import uuid
+from datetime import date, datetime, timedelta, timezone
 
 import anthropic
 import requests
 import streamlit as st
 from dateutil import parser as dateparser
+
+# ── Supabase client ───────────────────────────────────────────────────────────
+try:
+    from supabase import create_client as _sb_create
+    _supabase = _sb_create(st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"])
+except Exception:
+    _supabase = None
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -605,6 +613,24 @@ def extract_video(transcript: str, url: str, platform: str, saved_by: str) -> di
     return json.loads(_strip_json(msg.content[0].text))
 
 
+def _sales_fetch_meetings(file_id: str, site_id: str | None = None) -> list:
+    """Returns up to 10 most-recent MeetingLog rows as flat value lists."""
+    url = f"{_table_base(file_id, site_id)}/MeetingLog/rows"
+    try:
+        resp = requests.get(url, headers=_headers(), timeout=20)
+        if resp.status_code != 200:
+            return []
+        rows = resp.json().get("value", [])
+        flat = sorted(
+            [r.get("values", [[]])[0] for r in rows if r.get("values")],
+            key=lambda v: v[0] if v else "",
+            reverse=True,
+        )
+        return flat[:10]
+    except Exception:
+        return []
+
+
 def _get_pending_rows(file_id: str, table_name: str) -> list:
     """Returns list of (row_index, values_list) for rows where status == 'pending'."""
     rows = get_table_rows(file_id, table_name)
@@ -639,6 +665,16 @@ _DEFAULTS = {
     "cap_mtg_extracted": None,
     "cap_last_mtg_id": None,
     "cap_vid_extracted": None,
+    "cap_lead_prompt": None,
+    "sales_gen": 0,
+    "sales_prefill": {},
+    "sales_success": "",
+    "sales_confirm_dupe": False,
+    "sales_confirm_venue": "",
+    "sales_confirm_stage": "",
+    "sales_pending_record": {},
+    "sales_mtg_list": [],
+    "active_tab": "",
 }
 for _k, _v in _DEFAULTS.items():
     if _k not in st.session_state:
@@ -695,7 +731,7 @@ _ai_call_count = len(st.session_state.get("api_call_log", []))
 st.sidebar.caption(f"AI calls this session: {_ai_call_count}/50")
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
-gifting_tab, event_tab, creator_tab, capture_tab, finance_tab = st.tabs(["Gifting Log", "Event Wrap-Up", "Creator Applications", "📥 Capture Review", "💰 Finance"])
+gifting_tab, event_tab, creator_tab, capture_tab, finance_tab, sales_tab = st.tabs(["Gifting Log", "Event Wrap-Up", "Creator Applications", "📥 Capture Review", "💰 Finance", "🤝 Sales"])
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1582,6 +1618,20 @@ with capture_tab:
         st.success(st.session_state["cap_success"])
         st.session_state["cap_success"] = ""
 
+    if st.session_state.get("cap_lead_prompt"):
+        st.info("Meeting logged. Create a lead from this capture?")
+        _lc1, _lc2 = st.columns(2)
+        with _lc1:
+            if st.button("Yes — Open Sales Tab", key="cap_lead_yes"):
+                st.session_state["sales_prefill"] = st.session_state["cap_lead_prompt"]
+                st.session_state["active_tab"] = "sales"
+                st.session_state["cap_lead_prompt"] = None
+                st.rerun()
+        with _lc2:
+            if st.button("Skip", key="cap_lead_skip"):
+                st.session_state["cap_lead_prompt"] = None
+                st.rerun()
+
     st.markdown("### Capture Review")
 
     _cgen = st.session_state["cap_gen"]
@@ -1796,6 +1846,20 @@ with capture_tab:
                     _ok = append_row(st.secrets["MEETINGS_FILE_ID"], "MeetingLog", _mtg_row,
                                     site_id=st.secrets["STRATEGY_SITE_ID"])
                 if _ok:
+                    _cap_vtype_map = {
+                        "Medspa": "Medspa", "Recovery Studio": "Recovery Studio",
+                        "Wellness Studio": "Wellness Studio", "Gym": "Performance Gym",
+                        "Corporate": "Corporate", "Hotel": "Hotel", "Event": "Event Space",
+                    }
+                    _cap_fus = _mtg_ext.get("follow_up_items") or []
+                    st.session_state["cap_lead_prompt"] = {
+                        "venue_name": str(_mtg_ext.get("venue_name") or ""),
+                        "contact_name": str(_mtg_ext.get("contact_name") or ""),
+                        "category": _cap_vtype_map.get(str(_mtg_ext.get("venue_type") or ""), "Other"),
+                        "notes": str(_mtg_ext.get("key_insight") or ""),
+                        "next_action": _cap_fus[0].strip() if _cap_fus else "",
+                        "assigned_founder": str(_mtg_ext.get("assigned_founder") or "Kolton"),
+                    }
                     st.session_state["cap_success"] = (
                         f"Meeting captured: {_mtg_ext.get('contact_name','—')} - "
                         f"{_mtg_ext.get('venue_name','—')} (pending confirmation)"
@@ -2391,3 +2455,232 @@ with finance_tab:
                     else:
                         st.warning(f"{_ap_errs} row(s) failed to approve.")
                     st.rerun()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SALES TAB
+# ═══════════════════════════════════════════════════════════════════════════════
+with sales_tab:
+
+    _sgen = st.session_state["sales_gen"]
+
+    if st.session_state["sales_success"]:
+        st.success(st.session_state["sales_success"])
+        st.session_state["sales_success"] = ""
+
+    # Pre-fill banner
+    _spf = st.session_state.get("sales_prefill", {})
+    if _spf:
+        st.info(f"Pre-filled from meeting: **{_spf.get('venue_name', '')}** — edit below or clear.")
+        if st.button("Clear Pre-fill →", key=f"sales_clear_{_sgen}"):
+            st.session_state["sales_prefill"] = {}
+            st.rerun()
+
+    st.markdown("### 🤝 Sales")
+
+    # ── Section A — Record Type ────────────────────────────────────────────────
+    _sales_type = st.radio(
+        "Record Type",
+        ["Lead", "Customer"],
+        horizontal=True,
+        key=f"sales_type_{_sgen}",
+        label_visibility="collapsed",
+    )
+    st.markdown("---")
+
+    # ── Section C — Pre-fill from recent meeting capture ──────────────────────
+    with st.expander("Pre-fill from recent meeting capture", expanded=False):
+        if st.button("Load Recent Meetings →", key=f"sales_load_mtg_{_sgen}"):
+            _smtg_fid = st.secrets.get("MEETINGS_FILE_ID", "")
+            _smtg_sid = st.secrets.get("STRATEGY_SITE_ID")
+            if _smtg_fid and _smtg_fid != "paste-your-value-here":
+                with st.spinner("Loading meetings..."):
+                    _fetched_mtgs = _sales_fetch_meetings(_smtg_fid, _smtg_sid)
+                st.session_state["sales_mtg_list"] = _fetched_mtgs
+                st.rerun()
+            else:
+                st.warning("MEETINGS_FILE_ID not configured.")
+
+        _smtg_list = st.session_state.get("sales_mtg_list", [])
+        if _smtg_list:
+            _smtg_opts = [
+                f"{str(r[4] or '—')} — {str(r[6] or '—')}"
+                for r in _smtg_list
+            ]
+            _smtg_sel = st.selectbox(
+                "Select meeting",
+                range(len(_smtg_opts)),
+                format_func=lambda i: _smtg_opts[i],
+                key=f"sales_mtg_sel_{_sgen}",
+            )
+            if st.button("Pre-fill from this meeting →", key=f"sales_mtg_pf_{_sgen}"):
+                _sr = _smtg_list[_smtg_sel]
+                _sv_map = {
+                    "Medspa": "Medspa", "Recovery Studio": "Recovery Studio",
+                    "Wellness Studio": "Wellness Studio", "Gym": "Performance Gym",
+                    "Corporate": "Corporate", "Hotel": "Hotel", "Event": "Event Space",
+                }
+                _sr_fus = [x.strip() for x in str(_sr[14] or "").split(";") if x.strip()]
+                st.session_state["sales_prefill"] = {
+                    "venue_name": str(_sr[4] or ""),
+                    "contact_name": str(_sr[2] or ""),
+                    "category": _sv_map.get(str(_sr[5] or ""), "Other"),
+                    "notes": str(_sr[13] or ""),
+                    "next_action": _sr_fus[0] if _sr_fus else "",
+                    "assigned_founder": str(_sr[7] or "Kolton"),
+                }
+                st.session_state["sales_mtg_list"] = []
+                st.rerun()
+
+    st.markdown("---")
+
+    # ── Section B — Smart Form ─────────────────────────────────────────────────
+    _pf = st.session_state.get("sales_prefill", {})
+
+    # Essential fields
+    _venue_name = st.text_input(
+        "Venue Name *",
+        value=_pf.get("venue_name", ""),
+        placeholder="Studio, spa, gym name...",
+        key=f"sales_venue_{_sgen}",
+    )
+
+    _cat_opts = [
+        "Recovery Studio", "Medspa", "Performance Gym",
+        "Wellness Studio", "Corporate", "Hotel", "Event Space", "Other",
+    ]
+    _cat_default = _pf.get("category", "Recovery Studio")
+    _cat_idx = _cat_opts.index(_cat_default) if _cat_default in _cat_opts else 0
+    _category = st.selectbox("Category", _cat_opts, index=_cat_idx, key=f"sales_cat_{_sgen}")
+
+    _owner_opts = ["Kolton", "Cameron"]
+    _owner_idx = 1 if _pf.get("assigned_founder") == "Cameron" else 0
+    _owner = st.radio("Owner", _owner_opts, horizontal=True, index=_owner_idx, key=f"sales_owner_{_sgen}")
+
+    _stage_opts = ["Prospect", "Contacted", "Warm Lead", "In Progress", "Active"]
+    _stage = st.selectbox("Stage", _stage_opts, key=f"sales_stage_{_sgen}")
+
+    _contact_name = st.text_input(
+        "Contact Name",
+        value=_pf.get("contact_name", ""),
+        key=f"sales_contact_{_sgen}",
+    )
+
+    _next_action = st.text_input(
+        "Next Action",
+        value=_pf.get("next_action", ""),
+        key=f"sales_nxt_action_{_sgen}",
+    )
+
+    _next_due = st.date_input(
+        "Next Action Due",
+        value=date.today() + timedelta(days=7),
+        key=f"sales_nxt_due_{_sgen}",
+    )
+
+    # Expanded fields
+    with st.expander("+ More details", expanded=False):
+        _visibility = st.radio(
+            "Visibility", ["Public", "Private"],
+            horizontal=True, index=0, key=f"sales_vis_{_sgen}",
+        )
+        _source_opts = ["Referral", "Cold Outreach", "Event", "Walk-in", "Instagram", "Roeme", "Other"]
+        _source = st.selectbox("Source", _source_opts, key=f"sales_src_{_sgen}")
+        _phone = st.text_input("Phone", value=_pf.get("phone", ""), key=f"sales_phone_{_sgen}")
+        _email = st.text_input("Email", key=f"sales_email_{_sgen}")
+        _website = st.text_input("Website", value=_pf.get("website", ""), key=f"sales_website_{_sgen}")
+        _instagram = st.text_input("Instagram", value=_pf.get("instagram", ""), key=f"sales_ig_{_sgen}")
+        _franchise_opts = ["Independent", "Franchise", "Multi-location", "Unknown"]
+        _franchise = st.selectbox("Franchise Status", _franchise_opts, index=3, key=f"sales_fran_{_sgen}")
+        _address = st.text_input("Address", value=_pf.get("address", ""), key=f"sales_addr_{_sgen}")
+        _fit_score = st.slider("Fit Score", 1, 10, 5, key=f"sales_fit_{_sgen}")
+        _outreach_opts = ["Email", "DM", "Call", "In Person", "Text"]
+        _outreach_med = st.selectbox("Outreach Medium", _outreach_opts, key=f"sales_outm_{_sgen}")
+        _outreach_draft = st.text_area("Outreach Draft", height=100, key=f"sales_outd_{_sgen}")
+        _notes = st.text_area("Notes", value=_pf.get("notes", ""), height=80, key=f"sales_notes_{_sgen}")
+        _add_info = st.text_area("Additional Info", height=80, key=f"sales_addinfo_{_sgen}")
+
+    st.markdown("---")
+
+    # ── Section D — Duplicate Check and Save ──────────────────────────────────
+    if st.session_state.get("sales_confirm_dupe"):
+        _dupe_v = st.session_state["sales_confirm_venue"]
+        _dupe_s = st.session_state["sales_confirm_stage"]
+        st.warning(f"A record for **{_dupe_v}** already exists at stage **{_dupe_s}**. Save anyway?")
+        _dc1, _dc2 = st.columns(2)
+        with _dc1:
+            if st.button("Confirm →", key=f"sales_dupe_confirm_{_sgen}"):
+                _pending = st.session_state.get("sales_pending_record", {})
+                if _pending and _supabase:
+                    _supabase.table("leads").insert(_pending).execute()
+                    st.session_state["sales_success"] = (
+                        f"Saved: {_pending.get('venue_name','')} — "
+                        f"{_pending.get('stage','')} — {_pending.get('type','')}"
+                    )
+                    st.session_state["sales_confirm_dupe"] = False
+                    st.session_state["sales_pending_record"] = {}
+                    st.session_state["sales_prefill"] = {}
+                    st.session_state["sales_gen"] += 1
+                    st.balloons()
+                    st.rerun()
+        with _dc2:
+            if st.button("Cancel", key=f"sales_dupe_cancel_{_sgen}"):
+                st.session_state["sales_confirm_dupe"] = False
+                st.session_state["sales_pending_record"] = {}
+                st.rerun()
+
+    if st.button(f"Save {_sales_type} →", key=f"sales_save_{_sgen}"):
+        if not _venue_name.strip():
+            st.error("Venue Name is required.")
+        elif _supabase is None:
+            st.error("Supabase not configured — add SUPABASE_URL and SUPABASE_KEY to secrets.")
+        else:
+            _record = {
+                "id": str(uuid.uuid4()),
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+                "type": _sales_type,
+                "name": _venue_name.strip(),
+                "venue_name": _venue_name.strip(),
+                "category": _category,
+                "owner": _owner,
+                "stage": _stage,
+                "contact_name": _contact_name.strip(),
+                "next_action": _next_action.strip(),
+                "next_action_due": _next_due.isoformat() if _next_due else None,
+                "visibility": _visibility,
+                "source": _source,
+                "phone": _phone.strip(),
+                "email": _email.strip(),
+                "website": _website.strip(),
+                "instagram": _instagram.strip(),
+                "franchise_status": _franchise,
+                "address": _address.strip(),
+                "fit_score": int(_fit_score),
+                "outreach_medium": _outreach_med,
+                "outreach_draft": _outreach_draft.strip(),
+                "notes": _notes.strip(),
+                "additional_info": _add_info.strip(),
+            }
+            try:
+                _dupe_res = _supabase.table("leads").select("id,venue_name,stage").ilike(
+                    "venue_name", _venue_name.strip()
+                ).execute()
+                if _dupe_res.data:
+                    _d = _dupe_res.data[0]
+                    st.session_state["sales_confirm_dupe"] = True
+                    st.session_state["sales_confirm_venue"] = _d.get("venue_name", _venue_name.strip())
+                    st.session_state["sales_confirm_stage"] = _d.get("stage", "")
+                    st.session_state["sales_pending_record"] = _record
+                    st.rerun()
+                else:
+                    _supabase.table("leads").insert(_record).execute()
+                    st.session_state["sales_success"] = (
+                        f"Saved: {_venue_name.strip()} — {_stage} — {_sales_type}"
+                    )
+                    st.session_state["sales_prefill"] = {}
+                    st.session_state["sales_gen"] += 1
+                    st.balloons()
+                    st.rerun()
+            except Exception as _se:
+                st.error(f"Save failed: {_se}")
