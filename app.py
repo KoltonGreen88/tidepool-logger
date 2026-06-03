@@ -2251,8 +2251,6 @@ with finance_tab:
                 f"FINANCE_SUMMARY_FILE_ID={_fin_sum_fid!r} | "
                 f"tables: FinanceLog, FinanceSummary"
             )
-            st.write(st.session_state.get("finance_debug", ""))
-
             if st.button("Submit for Approval →", key="fin_submit_btn"):
                 if not _fin_fid:
                     st.error("FINANCE_FILE_ID not configured in secrets.")
