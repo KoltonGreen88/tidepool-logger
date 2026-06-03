@@ -309,6 +309,8 @@ def detect_content_type(url: str) -> str:
 
 
 def parse_with_ai(text: str) -> dict:
+    if not check_rate_limit():
+        return {}
     client = anthropic.Anthropic(api_key=st.secrets["ANTHROPIC_API_KEY"])
     today = date.today().isoformat()
     msg = client.messages.create(
@@ -347,6 +349,21 @@ def _strip_json(raw: str) -> str:
         if raw.lower().startswith("json"):
             raw = raw[4:].strip()
     return raw.strip()
+
+
+def check_rate_limit() -> bool:
+    now = time.time()
+    log = st.session_state.get("api_call_log", [])
+    if len(log) >= 50:
+        st.error("Session limit reached — 50 AI calls used this session. Refresh to reset.")
+        return False
+    recent = [t for t in log if now - t < 60]
+    if len(recent) >= 10:
+        st.error("Rate limit reached — too many AI calls in the last 60 seconds. Wait a moment and try again.")
+        return False
+    log.append(now)
+    st.session_state["api_call_log"] = log
+    return True
 
 
 def _fetch_granola_meetings() -> list | None:
@@ -473,6 +490,8 @@ def extract_meeting(content: str, data_source: str, meeting_type: str = "Externa
         "low = casual interest, no decision maker, no next step. "
         f"Meeting content: {content}"
     )
+    if not check_rate_limit():
+        return {}
     ac = anthropic.Anthropic(api_key=st.secrets["ANTHROPIC_API_KEY"])
     msg = ac.messages.create(
         model="claude-sonnet-4-5",
@@ -574,6 +593,8 @@ def extract_video(transcript: str, url: str, platform: str, saved_by: str) -> di
         "this video — specific and actionable, not generic). "
         f"Transcript: {transcript}"
     )
+    if not check_rate_limit():
+        return {}
     ac = anthropic.Anthropic(api_key=st.secrets["ANTHROPIC_API_KEY"])
     msg = ac.messages.create(
         model="claude-sonnet-4-5",
@@ -600,6 +621,7 @@ def _get_pending_rows(file_id: str, table_name: str) -> list:
 
 _DEFAULTS = {
     "authed": False,
+    "api_call_log": [],
     "g_parsed": {},
     "g_success": "",
     "e_pre_success": "",
@@ -667,6 +689,10 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
+
+# ── AI usage counter ──────────────────────────────────────────────────────────
+_ai_call_count = len(st.session_state.get("api_call_log", []))
+st.sidebar.caption(f"AI calls this session: {_ai_call_count}/50")
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
 gifting_tab, event_tab, creator_tab, capture_tab, finance_tab = st.tabs(["Gifting Log", "Event Wrap-Up", "Creator Applications", "📥 Capture Review", "💰 Finance"])
@@ -1176,6 +1202,8 @@ with creator_tab:
     if st.button("Parse with AI →", key=f"ca_parse_{_gen}"):
         if not _raw_input.strip():
             st.warning("Paste applicant text before parsing.")
+        elif not check_rate_limit():
+            pass
         else:
             _raw_resp = ""
             with st.spinner("Parsing applicants…"):
@@ -1340,51 +1368,54 @@ with creator_tab:
 
                 _ai_json = json.dumps(_full_for_ai)
                 _raw_resp = ""
-                with st.spinner("Analyzing applicants…"):
-                    try:
-                        _ac = anthropic.Anthropic(api_key=st.secrets["ANTHROPIC_API_KEY"])
-                        _amsg = _ac.messages.create(
-                            model="claude-sonnet-4-5",
-                            max_tokens=15000,
-                            messages=[{
-                                "role": "user",
-                                "content": (
-                                    "You are selecting creators for a TIDEPOOL gifting campaign. "
-                                    "TIDEPOOL is a glutathione and electrolyte recovery drink mix brand "
-                                    "based in Atlanta. DTC price $24.99. Target audience: wellness-oriented "
-                                    "25-35 year olds. Inventory is limited so selections must be high conviction.\n\n"
-                                    f"Select ONLY the top {int(ca_target)} applicants as tier 'selected'. "
-                                    "All others must be 'waitlist' or 'pass'. This limit is strict.\n\n"
-                                    "Score each applicant and recommend based on:\n"
-                                    "1. Authenticity — do they describe a real personal use case or is it generic?\n"
-                                    "2. Content angle — is there a clear natural content story (recovery, Sunday reset, post-workout, travel)?\n"
-                                    "3. Audience fit — does their audience match the TIDEPOOL wellness demographic?\n"
-                                    "4. Reach vs engagement — authentic voice matters more than raw follower count at nano level\n"
-                                    "5. Wholesale potential — does their venue, profession, or platform suggest a future wholesale relationship?\n\n"
-                                    "Return ONLY a valid JSON object with no markdown and no code fences in this exact structure:\n"
-                                    '{"campaign_summary": "three sentences on what this cohort signals about TIDEPOOL perception and one content theme to brief them all on", '
-                                    '"applicants": [{"name": "string", "tier": "selected or waitlist or pass", "score": "integer 1-10", '
-                                    '"reasoning": "two sentences max specific to their application", '
-                                    '"content_angle": "one sentence on what their content would look like", '
-                                    '"wholesale_flag": "true or false"}]}\n\n'
-                                    f"Sort applicants array by score descending. Applicants: {_ai_json}"
-                                ),
-                            }],
-                        )
-                        _raw_resp = _amsg.content[0].text.strip()
-                        if "```" in _raw_resp:
-                            _fp = _raw_resp.split("```")
-                            _raw_resp = _fp[1] if len(_fp) > 1 else _raw_resp
-                            if _raw_resp.lower().startswith("json"):
-                                _raw_resp = _raw_resp[4:].strip()
-                        _ai_result = json.loads(_raw_resp)
-                        st.session_state["ai_recommendation"] = _ai_result
-                        st.session_state["recommendation_overrides"] = {}
-                        st.rerun()
-                    except json.JSONDecodeError as _je:
-                        st.error(f"JSON parse failed: {_je}\n\nRaw API response:\n{_raw_resp}")
-                    except Exception as _exc:
-                        st.error(f"AI recommendation failed: {_exc}")
+                if not check_rate_limit():
+                    pass
+                else:
+                    with st.spinner("Analyzing applicants…"):
+                        try:
+                            _ac = anthropic.Anthropic(api_key=st.secrets["ANTHROPIC_API_KEY"])
+                            _amsg = _ac.messages.create(
+                                model="claude-sonnet-4-5",
+                                max_tokens=15000,
+                                messages=[{
+                                    "role": "user",
+                                    "content": (
+                                        "You are selecting creators for a TIDEPOOL gifting campaign. "
+                                        "TIDEPOOL is a glutathione and electrolyte recovery drink mix brand "
+                                        "based in Atlanta. DTC price $24.99. Target audience: wellness-oriented "
+                                        "25-35 year olds. Inventory is limited so selections must be high conviction.\n\n"
+                                        f"Select ONLY the top {int(ca_target)} applicants as tier 'selected'. "
+                                        "All others must be 'waitlist' or 'pass'. This limit is strict.\n\n"
+                                        "Score each applicant and recommend based on:\n"
+                                        "1. Authenticity — do they describe a real personal use case or is it generic?\n"
+                                        "2. Content angle — is there a clear natural content story (recovery, Sunday reset, post-workout, travel)?\n"
+                                        "3. Audience fit — does their audience match the TIDEPOOL wellness demographic?\n"
+                                        "4. Reach vs engagement — authentic voice matters more than raw follower count at nano level\n"
+                                        "5. Wholesale potential — does their venue, profession, or platform suggest a future wholesale relationship?\n\n"
+                                        "Return ONLY a valid JSON object with no markdown and no code fences in this exact structure:\n"
+                                        '{"campaign_summary": "three sentences on what this cohort signals about TIDEPOOL perception and one content theme to brief them all on", '
+                                        '"applicants": [{"name": "string", "tier": "selected or waitlist or pass", "score": "integer 1-10", '
+                                        '"reasoning": "two sentences max specific to their application", '
+                                        '"content_angle": "one sentence on what their content would look like", '
+                                        '"wholesale_flag": "true or false"}]}\n\n'
+                                        f"Sort applicants array by score descending. Applicants: {_ai_json}"
+                                    ),
+                                }],
+                            )
+                            _raw_resp = _amsg.content[0].text.strip()
+                            if "```" in _raw_resp:
+                                _fp = _raw_resp.split("```")
+                                _raw_resp = _fp[1] if len(_fp) > 1 else _raw_resp
+                                if _raw_resp.lower().startswith("json"):
+                                    _raw_resp = _raw_resp[4:].strip()
+                            _ai_result = json.loads(_raw_resp)
+                            st.session_state["ai_recommendation"] = _ai_result
+                            st.session_state["recommendation_overrides"] = {}
+                            st.rerun()
+                        except json.JSONDecodeError as _je:
+                            st.error(f"JSON parse failed: {_je}\n\nRaw API response:\n{_raw_resp}")
+                        except Exception as _exc:
+                            st.error(f"AI recommendation failed: {_exc}")
 
             # ── Recommendation display (shown after Step 2 completes) ──────────
             _ai_rec = st.session_state.get("ai_recommendation")
@@ -2098,6 +2129,8 @@ with finance_tab:
         }
 
     def _categorize_transactions(txns: list) -> list:
+        if not check_rate_limit():
+            return []
         _sys = (
             "You are the TIDEPOOL Finance Agent. Categorize each bank transaction for TIDEPOOL LLC, "
             "a glutathione and electrolyte recovery drink mix brand based in Atlanta. "
