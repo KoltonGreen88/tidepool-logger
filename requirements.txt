@@ -3,4 +3,3 @@ requests
 anthropic
 python-dateutil
 pdfplumber
-supabase

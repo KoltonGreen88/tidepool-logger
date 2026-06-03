@@ -9,13 +9,6 @@ import requests
 import streamlit as st
 from dateutil import parser as dateparser
 
-# ── Supabase client ───────────────────────────────────────────────────────────
-try:
-    from supabase import create_client as _sb_create
-    _supabase = _sb_create(st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"])
-except Exception:
-    _supabase = None
-
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="TIDEPOOL Logger",
@@ -2625,85 +2618,52 @@ with sales_tab:
 
     st.markdown("---")
 
-    # ── Section D — Duplicate Check and Save ──────────────────────────────────
-    if st.session_state.get("sales_confirm_dupe"):
-        _dupe_v = st.session_state["sales_confirm_venue"]
-        _dupe_s = st.session_state["sales_confirm_stage"]
-        st.warning(f"A record for **{_dupe_v}** already exists at stage **{_dupe_s}**. Save anyway?")
-        _dc1, _dc2 = st.columns(2)
-        with _dc1:
-            if st.button("Confirm →", key=f"sales_dupe_confirm_{_sgen}"):
-                _pending = st.session_state.get("sales_pending_record", {})
-                if _pending and _supabase:
-                    _supabase.table("leads").insert(_pending).execute()
-                    st.session_state["sales_success"] = (
-                        f"Saved: {_pending.get('venue_name','')} — "
-                        f"{_pending.get('stage','')} — {_pending.get('type','')}"
-                    )
-                    st.session_state["sales_confirm_dupe"] = False
-                    st.session_state["sales_pending_record"] = {}
-                    st.session_state["sales_prefill"] = {}
-                    st.session_state["sales_gen"] += 1
-                    st.balloons()
-                    st.rerun()
-        with _dc2:
-            if st.button("Cancel", key=f"sales_dupe_cancel_{_sgen}"):
-                st.session_state["sales_confirm_dupe"] = False
-                st.session_state["sales_pending_record"] = {}
-                st.rerun()
-
+    # ── Section D — Save ──────────────────────────────────────────────────────
     if st.button(f"Save {_sales_type} →", key=f"sales_save_{_sgen}"):
         if not _venue_name.strip():
             st.error("Venue Name is required.")
-        elif _supabase is None:
-            st.error("Supabase not configured — add SUPABASE_URL and SUPABASE_KEY to secrets.")
         else:
-            _record = {
-                "id": str(uuid.uuid4()),
-                "created_at": datetime.now(timezone.utc).isoformat(),
-                "updated_at": datetime.now(timezone.utc).isoformat(),
-                "type": _sales_type,
-                "name": _venue_name.strip(),
-                "venue_name": _venue_name.strip(),
-                "category": _category,
-                "owner": _owner,
-                "stage": _stage,
-                "contact_name": _contact_name.strip(),
-                "next_action": _next_action.strip(),
-                "next_action_due": _next_due.isoformat() if _next_due else None,
-                "visibility": _visibility,
-                "source": _source,
-                "phone": _phone.strip(),
-                "email": _email.strip(),
-                "website": _website.strip(),
-                "instagram": _instagram.strip(),
-                "franchise_status": _franchise,
-                "address": _address.strip(),
-                "fit_score": int(_fit_score),
-                "outreach_medium": _outreach_med,
-                "outreach_draft": _outreach_draft.strip(),
-                "notes": _notes.strip(),
-                "additional_info": _add_info.strip(),
-            }
-            try:
-                _dupe_res = _supabase.table("leads").select("id,venue_name,stage").ilike(
-                    "venue_name", _venue_name.strip()
-                ).execute()
-                if _dupe_res.data:
-                    _d = _dupe_res.data[0]
-                    st.session_state["sales_confirm_dupe"] = True
-                    st.session_state["sales_confirm_venue"] = _d.get("venue_name", _venue_name.strip())
-                    st.session_state["sales_confirm_stage"] = _d.get("stage", "")
-                    st.session_state["sales_pending_record"] = _record
-                    st.rerun()
-                else:
-                    _supabase.table("leads").insert(_record).execute()
-                    st.session_state["sales_success"] = (
-                        f"Saved: {_venue_name.strip()} — {_stage} — {_sales_type}"
-                    )
-                    st.session_state["sales_prefill"] = {}
-                    st.session_state["sales_gen"] += 1
-                    st.balloons()
-                    st.rerun()
-            except Exception as _se:
-                st.error(f"Save failed: {_se}")
+            _now = datetime.now(timezone.utc).isoformat()
+            _values = [
+                str(uuid.uuid4()),
+                _venue_name.strip(),
+                _venue_name.strip(),
+                _stage,
+                _owner,
+                _category,
+                _sales_type,
+                _visibility,
+                _source,
+                _address.strip(),
+                _phone.strip(),
+                _website.strip(),
+                _email.strip(),
+                _instagram.strip(),
+                _contact_name.strip(),
+                _notes.strip(),
+                _add_info.strip(),
+                _next_action.strip(),
+                str(_next_due) if _next_due else "",
+                "",
+                _outreach_draft.strip(),
+                _outreach_med,
+                _now,
+                _now,
+                int(_fit_score),
+                _franchise,
+            ]
+            with st.spinner("Saving to SharePoint…"):
+                _ok = append_row(
+                    st.secrets["SALES_FILE_ID"],
+                    "SalesLeads",
+                    _values,
+                    site_id=st.secrets["SALES_SITE_ID"],
+                )
+            if _ok:
+                st.session_state["sales_success"] = (
+                    f"Saved: {_venue_name.strip()} — {_stage} — {_sales_type}"
+                )
+                st.session_state["sales_prefill"] = {}
+                st.session_state["sales_gen"] += 1
+                st.balloons()
+                st.rerun()
