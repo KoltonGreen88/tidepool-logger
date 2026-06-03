@@ -684,6 +684,7 @@ for _k, _v in _DEFAULTS.items():
 st.markdown(
     """
 <link rel='manifest' href='/app/static/manifest.json'>
+<link rel='apple-touch-icon' href='/app/static/icon-192.png'>
 <meta name='mobile-web-app-capable' content='yes'>
 <meta name='apple-mobile-web-app-capable' content='yes'>
 <meta name='apple-mobile-web-app-status-bar-style' content='black-translucent'>
