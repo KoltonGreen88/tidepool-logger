@@ -680,6 +680,28 @@ for _k, _v in _DEFAULTS.items():
     if _k not in st.session_state:
         st.session_state[_k] = _v
 
+# ── PWA meta tags ────────────────────────────────────────────────────────────
+st.markdown(
+    """
+<link rel='manifest' href='/app/static/manifest.json'>
+<meta name='mobile-web-app-capable' content='yes'>
+<meta name='apple-mobile-web-app-capable' content='yes'>
+<meta name='apple-mobile-web-app-status-bar-style' content='black-translucent'>
+<meta name='apple-mobile-web-app-title' content='TIDEPOOL Logger'>
+<meta name='theme-color' content='#1C2B4A'>
+<script>
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', function() {
+    navigator.serviceWorker.register('/app/static/service_worker.js')
+      .then(function(reg) { console.log('SW registered'); })
+      .catch(function(err) { console.log('SW error', err); });
+  });
+}
+</script>
+""",
+    unsafe_allow_html=True,
+)
+
 # ── Password gate ─────────────────────────────────────────────────────────────
 
 if not st.session_state["authed"]:
