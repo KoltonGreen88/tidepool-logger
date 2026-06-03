@@ -502,7 +502,6 @@ def _transcribe_video_mcp(url: str) -> dict | None:
             _raw_chunk = _line[len("data:"):].strip()
             if _first_data is None:
                 _first_data = _raw_chunk
-                st.session_state["video_mcp_raw"] = _raw_chunk
             _parsed = json.loads(_raw_chunk)
             if "result" in _parsed:
                 _result = _parsed["result"]
@@ -520,7 +519,6 @@ def _transcribe_video_mcp(url: str) -> dict | None:
             "title": _data.get("title") or None,
         }
     except Exception:
-        st.session_state["video_mcp_debug"] = traceback.format_exc()
         return None
 
 
@@ -1785,8 +1783,6 @@ with capture_tab:
         _manual_transcript = ""
         if _show_manual_transcript:
             st.warning("Could not transcribe this video. Paste transcript manually below.")
-            st.write("DEBUG RAW:", st.session_state.get("video_mcp_raw", "empty"))
-            st.write("DEBUG ERROR:", st.session_state.get("video_mcp_debug", "empty"))
             _manual_transcript = st.text_area(
                 "Paste transcript or caption text",
                 height=200,
