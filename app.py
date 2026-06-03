@@ -87,6 +87,21 @@ h1, h2, h3, h4, h5, h6 {
     color: #E8EAF0 !important;
     border-radius: 8px !important;
 }
+/* Selectbox selected value text */
+.stSelectbox > div > div > div {
+    color: #E8EAF0 !important;
+}
+/* Selectbox dropdown option list */
+[data-baseweb="select"] li,
+[data-baseweb="menu"] li,
+[data-baseweb="option"] {
+    color: #1C2B4A !important;
+    background: #ffffff !important;
+}
+option {
+    color: #1C2B4A !important;
+    background: #ffffff !important;
+}
 /* Date inputs */
 .stDateInput > div > div > input {
     background-color: #243350 !important;
@@ -168,6 +183,13 @@ hr { border-color: #3a4f70 !important; }
 
 /* Caption / helper text */
 .stCaption, small { color: #8090b0 !important; }
+
+/* Data editor category dropdown */
+[data-testid='stDataEditor'] [data-baseweb='select'] span { color: #1C2B4A !important; }
+[data-testid='stDataEditor'] [data-baseweb='select'] div { color: #1C2B4A !important; }
+[data-testid='stDataEditor'] [role='option'] { color: #1C2B4A !important; background-color: #ffffff !important; }
+[data-testid='stDataEditor'] [role='listbox'] { background-color: #ffffff !important; }
+[data-testid='stDataEditor'] input { color: #1C2B4A !important; background-color: #ffffff !important; }
 </style>
 """,
     unsafe_allow_html=True,
@@ -647,7 +669,7 @@ st.markdown(
 )
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
-gifting_tab, event_tab, creator_tab, capture_tab = st.tabs(["Gifting Log", "Event Wrap-Up", "Creator Applications", "📥 Capture Review"])
+gifting_tab, event_tab, creator_tab, capture_tab, finance_tab = st.tabs(["Gifting Log", "Event Wrap-Up", "Creator Applications", "📥 Capture Review", "💰 Finance"])
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1976,4 +1998,355 @@ with capture_tab:
                     _new_vals[-3] = "discarded"
                     with st.spinner("Discarding..."):
                         patch_row(_fid, _tbl, _ri, _new_vals)
+                    st.rerun()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# FINANCE TAB
+# ═══════════════════════════════════════════════════════════════════════════════
+with finance_tab:
+    import re as _re
+    import pandas as _pd
+    import pdfplumber as _pdfplumber
+
+    _fin_fid = st.secrets.get("FINANCE_FILE_ID", "")
+    _fin_sid = st.secrets.get("FINANCE_SITE_ID") or None
+    _fin_sum_fid = st.secrets.get("FINANCE_SUMMARY_FILE_ID", "")
+
+    def _fin_get_rows(table_name: str) -> list:
+        if not _fin_fid:
+            return []
+        _url = f"{_table_base(_fin_fid, _fin_sid)}/{table_name}/rows"
+        try:
+            _r = requests.get(_url, headers=_headers(), timeout=20)
+            return _r.json().get("value", []) if _r.status_code == 200 else []
+        except Exception:
+            return []
+
+    def _fin_patch_row(table_name: str, row_index: int, values: list) -> bool:
+        if not _fin_fid:
+            return False
+        _url = f"{_table_base(_fin_fid, _fin_sid)}/{table_name}/rows/itemAt(index={row_index})"
+        try:
+            _r = requests.patch(_url, headers=_headers(), json={"values": [values]}, timeout=20)
+            return _r.status_code in (200, 204)
+        except Exception:
+            return False
+
+    def _parse_bluevine(pdf_file) -> dict:
+        with _pdfplumber.open(pdf_file) as _pdf:
+            _full_text = "\n".join(_page.extract_text() or "" for _page in _pdf.pages)
+
+        # Statement month
+        statement_month = ""
+        _pm = _re.search(
+            r'Statement Period.*?(\w+\.?\s+\d{1,2},?\s*\d{4})',
+            _full_text, _re.IGNORECASE
+        )
+        if _pm:
+            try:
+                statement_month = dateparser.parse(_pm.group(1)).strftime("%B %Y")
+            except Exception:
+                statement_month = _pm.group(1)
+
+        # Balances — amount may be on the same line or the next non-empty line
+        beg_bal = end_bal = 0.0
+        _bal_lines = [l for l in _full_text.split('\n')]
+        for _i, _line in enumerate(_bal_lines):
+            _ll = _line.lower()
+            if 'beginning balance' not in _ll and 'ending balance' not in _ll:
+                continue
+            # Search same line first, then next non-empty line
+            _am = _re.search(r'\$-?([\d,]+\.\d{2})', _line)
+            if not _am:
+                for _next in _bal_lines[_i + 1:_i + 4]:
+                    if _next.strip():
+                        _am = _re.search(r'\$-?([\d,]+\.\d{2})', _next)
+                        if _am:
+                            break
+            if not _am:
+                continue
+            _v = float(_am.group(1).replace(',', ''))
+            if 'beginning balance' in _ll and not beg_bal:
+                beg_bal = _v
+            elif 'ending balance' in _ll and not end_bal:
+                end_bal = _v
+
+        # Transactions: lines starting with MM/DD/YY and ending with $amount or $-amount
+        _txn_re = _re.compile(
+            r'^(\d{2}/\d{2}/\d{2})\s+(.+?)\s+\$(-?[\d,]+\.\d{2})\s*$'
+        )
+        txns = []
+        for _line in _full_text.split('\n'):
+            _m = _txn_re.match(_line.strip())
+            if not _m:
+                continue
+            _date = _m.group(1)
+            _desc = _m.group(2).strip()
+            _amt = float(_m.group(3).replace(',', ''))
+            _typ = "Credit" if _amt >= 0 else "Debit"
+            txns.append({"date": _date, "description": _desc, "amount": _amt, "type": _typ})
+
+        return {
+            "statement_month": statement_month,
+            "beginning_balance": beg_bal,
+            "ending_balance": end_bal,
+            "transactions": txns,
+        }
+
+    def _categorize_transactions(txns: list) -> list:
+        _sys = (
+            "You are the TIDEPOOL Finance Agent. Categorize each bank transaction for TIDEPOOL LLC, "
+            "a glutathione and electrolyte recovery drink mix brand based in Atlanta. "
+            "Return ONLY a valid JSON array with no markdown. Each object must have: "
+            "date, description, amount (float), type (Credit or Debit), "
+            "category (one of: Revenue, Inventory, Shipping, Marketing, Platform Fees, Events, "
+            "Supplies, Contractor, Internal Transfer, Owner Draw, Bank Interest, Uncategorized), "
+            "confidence (high/medium/low), notes (one sentence explanation or null).\n\n"
+            "Categorization rules:\n"
+            "- BENNETT GRAPHICS or stick pack or inventory supplier → Inventory\n"
+            "- SHOPIFY* charges → Platform Fees\n"
+            "- TIDEPOOL SHOPIFY or Shopify payout → Revenue\n"
+            "- USPS or UPS or FedEx or CLICKNSHIP → Shipping\n"
+            "- BLOOM MARKETING or Meta or Google or TikTok ads → Marketing\n"
+            "- WAL-MART or SAMS CLUB or WM SUPERCENTER or AMAZON or TEMU → Supplies\n"
+            "- TOWER BEER WINE or venue or event → Events\n"
+            "- Mailchimp or software or app subscription → Platform Fees\n"
+            "- VENMO *[person name] → Contractor\n"
+            "- VENMO *Kolton Green or owner name → Owner Draw\n"
+            "- Transfer to/from Chase or Wells Fargo IFI → Internal Transfer\n"
+            "- Interest earned → Bank Interest\n"
+            "- Anything unclear → Uncategorized with confidence low\n"
+            "Never invent categories. Return null notes for obvious transactions."
+        )
+        _ac = anthropic.Anthropic(api_key=st.secrets["ANTHROPIC_API_KEY"])
+        _msg = _ac.messages.create(
+            model="claude-sonnet-4-5",
+            max_tokens=4096,
+            system=_sys,
+            messages=[{"role": "user", "content": f"Categorize these transactions:\n{json.dumps(txns)}"}],
+        )
+        return json.loads(_strip_json(_msg.content[0].text))
+
+    # ── Header ────────────────────────────────────────────────────────────────
+    st.markdown("### 💰 Finance")
+
+    # ── Section A: Upload ─────────────────────────────────────────────────────
+    st.markdown("#### Upload Bluevine Statement")
+    _fin_pdf = st.file_uploader("Upload Bluevine Monthly Statement", type=["pdf"], key="fin_pdf_upload")
+
+    if _fin_pdf is not None:
+        if st.button("Parse Statement →", key="fin_parse_btn"):
+            with st.spinner("Extracting transactions from PDF..."):
+                try:
+                    _parsed = _parse_bluevine(_fin_pdf)
+                    st.session_state["fin_parsed"] = _parsed
+                    st.session_state["fin_categorized"] = None
+                    st.rerun()
+                except Exception as _exc:
+                    st.error(f"PDF parse error: {_exc}")
+
+    _fin_parsed = st.session_state.get("fin_parsed")
+
+    if _fin_parsed:
+        st.caption(
+            f"**{_fin_parsed['statement_month']}** — "
+            f"{len(_fin_parsed['transactions'])} transactions | "
+            f"Beginning: ${_fin_parsed['beginning_balance']:,.2f} → "
+            f"Ending: ${_fin_parsed['ending_balance']:,.2f}"
+        )
+
+        # ── Section B: Auto-categorization ───────────────────────────────────
+        if st.session_state.get("fin_categorized") is None:
+            if st.button("Auto-Categorize with AI →", key="fin_cat_btn"):
+                with st.spinner("Categorizing with AI..."):
+                    try:
+                        _cats = _categorize_transactions(_fin_parsed["transactions"])
+                        st.session_state["fin_categorized"] = _cats
+                        st.rerun()
+                    except Exception as _exc:
+                        st.error(f"Categorization error: {_exc}")
+
+        _fin_cats = st.session_state.get("fin_categorized")
+
+        if _fin_cats:
+            # ── Section C: Review Table ───────────────────────────────────────
+            _cat_opts = [
+                "Revenue", "Inventory", "Shipping", "Marketing", "Platform Fees",
+                "Events", "Supplies", "Contractor", "Internal Transfer",
+                "Owner Draw", "Bank Interest", "Uncategorized",
+            ]
+            _conf_map = {"high": "🟢 high", "medium": "🟡 medium", "low": "🔴 low"}
+
+            _low_count = sum(1 for _t in _fin_cats if str(_t.get("confidence", "")).lower() == "low")
+            if _low_count:
+                st.warning(f"⚠️ {_low_count} transaction{'s' if _low_count > 1 else ''} need review — confidence is low")
+
+            _df_rows = [
+                {
+                    "Date": _t.get("date", ""),
+                    "Description": _t.get("description", ""),
+                    "Amount": float(_t.get("amount", 0)),
+                    "Amt": (
+                        f"(${abs(float(_t.get('amount', 0))):,.2f})"
+                        if float(_t.get("amount", 0)) < 0
+                        else f"${float(_t.get('amount', 0)):,.2f}"
+                    ),
+                    "Type": _t.get("type", ""),
+                    "Category": _t.get("category", "Uncategorized"),
+                    "Confidence": _conf_map.get(str(_t.get("confidence", "")).lower(), str(_t.get("confidence", ""))),
+                    "Notes": _t.get("notes") or "",
+                }
+                for _t in sorted(_fin_cats, key=lambda x: x.get("date", ""))
+            ]
+            _df = _pd.DataFrame(_df_rows)
+
+            _edited = st.data_editor(
+                _df,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Date": st.column_config.TextColumn("Date", disabled=True),
+                    "Description": st.column_config.TextColumn("Description", disabled=True, width="large"),
+                    "Amount": None,
+                    "Amt": st.column_config.TextColumn("Amount", disabled=True),
+                    "Type": st.column_config.TextColumn("Type", disabled=True),
+                    "Category": st.column_config.SelectboxColumn("Category", options=_cat_opts, required=True),
+                    "Confidence": st.column_config.TextColumn("Confidence", disabled=True),
+                    "Notes": st.column_config.TextColumn("Notes", width="medium"),
+                },
+                key="fin_editor",
+            )
+
+            _total_credits = float(_df[_df["Amount"] > 0]["Amount"].sum())
+            _total_debits = float(_df[_df["Amount"] < 0]["Amount"].sum())
+            _net = _total_credits + _total_debits
+            st.markdown(
+                f"**Total Credits:** `${_total_credits:,.2f}` &nbsp;|&nbsp; "
+                f"**Total Debits:** `${abs(_total_debits):,.2f}` &nbsp;|&nbsp; "
+                f"**Net:** `${_net:,.2f}`"
+            )
+
+            # ── Section D: Submit ─────────────────────────────────────────────
+            st.markdown("---")
+            st.markdown("#### Submit for Approval")
+            _sc1, _sc2 = st.columns(2)
+            with _sc1:
+                st.markdown(f"**Statement Month:** {_fin_parsed['statement_month']}")
+                st.markdown(f"**Beginning Balance:** ${_fin_parsed['beginning_balance']:,.2f}")
+                st.markdown(f"**Ending Balance:** ${_fin_parsed['ending_balance']:,.2f}")
+            with _sc2:
+                st.markdown(f"**Transactions:** {len(_fin_cats)}")
+                st.markdown(f"**Total Credits:** ${_total_credits:,.2f}")
+                st.markdown(f"**Total Debits:** ${abs(_total_debits):,.2f}")
+
+            _fin_logger = st.radio("Logged by", ["Kolton", "Cameron"], horizontal=True, key="fin_logged_by")
+
+            if st.button("Submit for Approval →", key="fin_submit_btn"):
+                if not _fin_fid:
+                    st.error("FINANCE_FILE_ID not configured in secrets.")
+                else:
+                    _ts = datetime.now().isoformat(timespec="seconds")
+                    _month = _fin_parsed["statement_month"]
+                    _errs = 0
+                    with st.spinner("Writing to SharePoint..."):
+                        for _, _row in _edited.iterrows():
+                            _conf_clean = (
+                                str(_row["Confidence"])
+                                .replace("🟢 ", "").replace("🟡 ", "").replace("🔴 ", "")
+                            )
+                            _txn_vals = [
+                                _ts, _month,
+                                str(_row["Date"]),
+                                str(_row["Description"]),
+                                float(_row["Amount"]),
+                                str(_row["Type"]),
+                                str(_row["Category"]),
+                                _conf_clean,
+                                _fin_logger,
+                                "",
+                                "pending_approval",
+                                str(_row["Notes"]),
+                            ]
+                            if not append_row(_fin_fid, "TIDEPOOL_Finance", _txn_vals, site_id=_fin_sid):
+                                _errs += 1
+                        if _fin_sum_fid:
+                            append_row(_fin_sum_fid, "TIDEPOOL_Finance_Summary", [
+                                _ts, _month,
+                                _fin_parsed["beginning_balance"],
+                                _fin_parsed["ending_balance"],
+                                _total_credits, abs(_total_debits), _net,
+                                len(_fin_cats), _fin_logger, "pending_approval",
+                            ], site_id=_fin_sid)
+                    if _errs == 0:
+                        st.success(
+                            f"Submitted: {_month} — {len(_fin_cats)} transactions pending Cameron approval"
+                        )
+                        st.session_state["fin_parsed"] = None
+                        st.session_state["fin_categorized"] = None
+                        st.rerun()
+                    else:
+                        st.warning(f"{_errs} row(s) failed to write.")
+
+    # ── Section E: Approval Queue ─────────────────────────────────────────────
+    st.markdown("---")
+    st.markdown("#### Approval Queue")
+
+    if not _fin_fid:
+        st.caption("FINANCE_FILE_ID not configured.")
+    else:
+        _fin_all_rows = _fin_get_rows("TIDEPOOL_Finance")
+        # Column order: Timestamp(0) StatementMonth(1) Date(2) Description(3)
+        # Amount(4) Type(5) Category(6) Confidence(7) LoggedBy(8) ApprovedBy(9) Status(10) Notes(11)
+        _fin_pending = [
+            (r.get("index", 0), (r.get("values") or [[]])[0])
+            for r in _fin_all_rows
+            if len((r.get("values") or [[]])[0]) > 10
+            and (r.get("values") or [[]])[0][10] == "pending_approval"
+        ]
+
+        if not _fin_pending:
+            st.caption("No transactions pending approval.")
+        else:
+            _by_month: dict = {}
+            _months_order: list = []
+            for _ri, _vals in _fin_pending:
+                _m = _vals[1] if len(_vals) > 1 else "Unknown"
+                if _m not in _by_month:
+                    _by_month[_m] = []
+                    _months_order.append(_m)
+                _by_month[_m].append((_ri, _vals))
+
+            _fin_approver = st.radio(
+                "Approving as", ["Kolton", "Cameron"], horizontal=True, key="fin_approver"
+            )
+
+            for _month in _months_order:
+                _month_rows = _by_month[_month]
+                st.markdown(f"**{_month}** — {len(_month_rows)} transactions")
+                _preview = _pd.DataFrame([
+                    {
+                        "Date": _v[2] if len(_v) > 2 else "",
+                        "Description": _v[3] if len(_v) > 3 else "",
+                        "Amount": _v[4] if len(_v) > 4 else "",
+                        "Category": _v[6] if len(_v) > 6 else "",
+                    }
+                    for _, _v in _month_rows[:10]
+                ])
+                st.dataframe(_preview, use_container_width=True, hide_index=True)
+
+                if st.button(f"Approve All — {_month} →", key=f"fin_approve_{_month.replace(' ', '_')}"):
+                    _ap_errs = 0
+                    with st.spinner(f"Approving {_month}..."):
+                        for _ri, _vals in _month_rows:
+                            _new_vals = list(_vals)
+                            if len(_new_vals) > 10:
+                                _new_vals[9] = _fin_approver
+                                _new_vals[10] = "approved"
+                            if not _fin_patch_row("TIDEPOOL_Finance", _ri, _new_vals):
+                                _ap_errs += 1
+                    if _ap_errs == 0:
+                        st.success(f"Approved {len(_month_rows)} transactions for {_month}.")
+                    else:
+                        st.warning(f"{_ap_errs} row(s) failed to approve.")
                     st.rerun()

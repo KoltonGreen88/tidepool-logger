@@ -2,3 +2,4 @@ streamlit
 requests
 anthropic
 python-dateutil
+pdfplumber
