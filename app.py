@@ -661,6 +661,7 @@ _DEFAULTS = {
     "cap_lead_prompt": None,
     "sales_gen": 0,
     "sales_prefill": {},
+    "sales_prefill_applied": False,
     "sales_success": "",
     "sales_confirm_dupe": False,
     "sales_confirm_venue": "",
@@ -1638,11 +1639,18 @@ with capture_tab:
         st.info("Meeting logged. Create a lead from this capture?")
         _lc1, _lc2 = st.columns(2)
         with _lc1:
-            if st.button("Yes — Open Sales Tab", key="cap_lead_yes"):
+            if st.button("Yes — Pre-fill Sales Form", key="cap_lead_yes"):
                 st.session_state["sales_prefill"] = st.session_state["cap_lead_prompt"]
-                st.session_state["active_tab"] = "sales"
+                st.session_state["sales_prefill_applied"] = False
                 st.session_state["cap_lead_prompt"] = None
-                st.rerun()
+                st.markdown(
+                    '<div style="background:#E8C94A; color:#1C2B4A; border-radius:8px; '
+                    'padding:12px 16px; font-weight:600; font-size:14px;">'
+                    "Meeting data saved — tap the Sales tab above to create the lead. "
+                    "Fields will be pre-filled."
+                    "</div>",
+                    unsafe_allow_html=True,
+                )
         with _lc2:
             if st.button("Skip", key="cap_lead_skip"):
                 st.session_state["cap_lead_prompt"] = None
@@ -2480,6 +2488,25 @@ with sales_tab:
 
     _sgen = st.session_state["sales_gen"]
 
+    # Inject prefill values directly into widget session state keys (once per prefill event)
+    _spf_data = st.session_state.get("sales_prefill", {})
+    if _spf_data and not st.session_state.get("sales_prefill_applied", False):
+        _pf_cat_opts = [
+            "Recovery Studio", "Medspa", "Performance Gym",
+            "Wellness Studio", "Corporate", "Hotel", "Event Space", "Other",
+        ]
+        _pf_cat_val = _spf_data.get("category", "")
+        st.session_state[f"sales_venue_{_sgen}"] = _spf_data.get("venue_name", "")
+        if _pf_cat_val in _pf_cat_opts:
+            st.session_state[f"sales_cat_{_sgen}"] = _pf_cat_val
+        st.session_state[f"sales_owner_{_sgen}"] = (
+            "Cameron" if _spf_data.get("assigned_founder") == "Cameron" else "Kolton"
+        )
+        st.session_state[f"sales_contact_{_sgen}"] = _spf_data.get("contact_name", "")
+        st.session_state[f"sales_nxt_action_{_sgen}"] = _spf_data.get("next_action", "")
+        st.session_state[f"sales_notes_{_sgen}"] = _spf_data.get("notes", "")
+        st.session_state["sales_prefill_applied"] = True
+
     if st.session_state["sales_success"]:
         st.success(st.session_state["sales_success"])
         st.session_state["sales_success"] = ""
@@ -2490,6 +2517,8 @@ with sales_tab:
         st.info(f"Pre-filled from meeting: **{_spf.get('venue_name', '')}** — edit below or clear.")
         if st.button("Clear Pre-fill →", key=f"sales_clear_{_sgen}"):
             st.session_state["sales_prefill"] = {}
+            st.session_state["sales_prefill_applied"] = False
+            st.session_state["sales_gen"] += 1
             st.rerun()
 
     st.markdown("### 🤝 Sales")
@@ -2545,6 +2574,7 @@ with sales_tab:
                     "next_action": _sr_fus[0] if _sr_fus else "",
                     "assigned_founder": str(_sr[7] or "Kolton"),
                 }
+                st.session_state["sales_prefill_applied"] = False
                 st.session_state["sales_mtg_list"] = []
                 st.rerun()
 
