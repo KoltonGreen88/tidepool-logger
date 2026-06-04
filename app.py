@@ -844,7 +844,7 @@ with gifting_tab:
                 value=max(0, int(parsed.get("bags") or 0)),
             )
             venue = st.text_input(
-                "Venue *",
+                "Venue",
                 value=parsed.get("venue", ""),
                 placeholder="Studio, spa, hotel, event space…",
             )
@@ -882,8 +882,6 @@ with gifting_tab:
                 errors.append("Recipient is required.")
             if bags <= 0:
                 errors.append("Bags must be at least 1.")
-            if not venue.strip():
-                errors.append("Venue is required.")
 
             if errors:
                 for err in errors:
@@ -1109,7 +1107,7 @@ with event_tab:
 
             pre_submit = st.form_submit_button("Pre-Log Event →")
 
-        if pre_submit:
+        if pre_submit and not st.session_state.get("event_dupe_confirm"):
             errors = []
             if not e_venue.strip():
                 errors.append("Venue is required.")
@@ -1972,7 +1970,7 @@ with capture_tab:
                         st.session_state["meeting_dupe_pending"] = {}
                         st.rerun()
 
-            if st.button("Log to SharePoint →", key=f"cap_mtg_log_{_cgen}"):
+            if st.button("Log to SharePoint →", key=f"cap_mtg_log_{_cgen}") and not st.session_state.get("meeting_dupe_confirm"):
                 _fu_str = "; ".join(_mtg_ext.get("follow_up_items") or [])
                 _mtg_row = [
                     _mtg_ext.get("timestamp", datetime.now().isoformat(timespec="seconds")),
@@ -2200,7 +2198,7 @@ with capture_tab:
                         st.session_state["video_dupe_pending"] = {}
                         st.rerun()
 
-            if st.button("Log to SharePoint →", key=f"cap_vid_log_{_cgen}"):
+            if st.button("Log to SharePoint →", key=f"cap_vid_log_{_cgen}") and not st.session_state.get("video_dupe_confirm"):
                 _vid_row = [
                     str(_vid_ext.get("source_url") or ""),
                     str(_vid_ext.get("platform") or ""),
@@ -2636,7 +2634,7 @@ with finance_tab:
                         st.session_state["finance_dupe_pending"] = {}
                         st.rerun()
 
-            if st.button("Submit for Approval →", key="fin_submit_btn"):
+            if st.button("Submit for Approval →", key="fin_submit_btn") and not st.session_state.get("finance_dupe_confirm"):
                 if not _fin_fid:
                     st.error("FINANCE_FILE_ID not configured in secrets.")
                 else:
@@ -2955,7 +2953,7 @@ with sales_tab:
                 st.session_state["sales_dupe_pending"] = {}
                 st.rerun()
 
-    if st.button(f"Save {_sales_type} →", key=f"sales_save_{_sgen}"):
+    if st.button(f"Save {_sales_type} →", key=f"sales_save_{_sgen}") and not st.session_state.get("sales_dupe_confirm"):
         if not _venue_name.strip():
             st.error("Venue Name is required.")
         else:
