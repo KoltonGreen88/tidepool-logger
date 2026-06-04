@@ -256,8 +256,8 @@ def append_row(file_id: str, table_name: str, values: list, site_id: str | None 
         return False
 
 
-def get_table_rows(file_id: str, table_name: str) -> list:
-    url = f"{_table_base(file_id)}/{table_name}/rows"
+def get_table_rows(file_id: str, table_name: str, site_id: str | None = None) -> list:
+    url = f"{_table_base(file_id, site_id)}/{table_name}/rows"
     try:
         resp = requests.get(url, headers=_headers(), timeout=20)
         if resp.status_code == 404:
@@ -669,6 +669,18 @@ _DEFAULTS = {
     "sales_pending_record": {},
     "sales_mtg_list": [],
     "active_tab": "",
+    "gift_dupe_confirm": False,
+    "gift_dupe_pending": {},
+    "sales_dupe_confirm": False,
+    "sales_dupe_pending": {},
+    "event_dupe_confirm": False,
+    "event_dupe_pending": {},
+    "meeting_dupe_confirm": False,
+    "meeting_dupe_pending": {},
+    "finance_dupe_confirm": False,
+    "finance_dupe_pending": {},
+    "video_dupe_confirm": False,
+    "video_dupe_pending": {},
 }
 for _k, _v in _DEFAULTS.items():
     if _k not in st.session_state:
@@ -793,6 +805,29 @@ with gifting_tab:
 
         parsed = st.session_state["g_parsed"]
 
+        if st.session_state.get("gift_dupe_confirm"):
+            _gd = st.session_state["gift_dupe_pending"]
+            st.warning(
+                f"You gifted {_gd['recipient']} {_gd['match_bags']} bags on "
+                f"{_gd['match_date']}. Gift again?"
+            )
+            _gc1, _gc2 = st.columns(2)
+            with _gc1:
+                if st.button("Confirm →", key="gift_dupe_confirm_btn"):
+                    with st.spinner("Saving to SharePoint…"):
+                        _ok = append_row(st.secrets["GIFTING_FILE_ID"], "GiftingLog", _gd["row"])
+                    if _ok:
+                        st.session_state["g_success"] = _gd["success_msg"]
+                        st.session_state["g_parsed"] = {}
+                        st.session_state["gift_dupe_confirm"] = False
+                        st.session_state["gift_dupe_pending"] = {}
+                        st.rerun()
+            with _gc2:
+                if st.button("Cancel", key="gift_dupe_cancel_btn"):
+                    st.session_state["gift_dupe_confirm"] = False
+                    st.session_state["gift_dupe_pending"] = {}
+                    st.rerun()
+
         # ── Gifting form ──────────────────────────────────────────────────────
         # GiftingLog columns:
         # Timestamp | Recipient | Bags | Venue | Date | LoggedBy | Notes | Posted | PostLink | ContentType
@@ -869,15 +904,42 @@ with gifting_tab:
                     used_link,
                     content_type,
                 ]
-                with st.spinner("Saving to SharePoint…"):
-                    ok = append_row(st.secrets["GIFTING_FILE_ID"], "GiftingLog", row)
-                if ok:
-                    st.session_state["g_success"] = (
-                        f"Logged: {recipient.strip()} · {int(bags)} bags · "
-                        f"{venue.strip()} · {gift_date.isoformat()}"
-                    )
-                    st.session_state["g_parsed"] = {}
+                _thirty_ago = (date.today() - timedelta(days=30)).isoformat()
+                with st.spinner("Checking for duplicates…"):
+                    _all_gifts = get_table_rows(st.secrets["GIFTING_FILE_ID"], "GiftingLog")
+                _gift_match = None
+                for _gr in _all_gifts:
+                    _gv = (_gr.get("values") or [[]])[0]
+                    if (
+                        len(_gv) > 4
+                        and str(_gv[1]).strip().lower() == recipient.strip().lower()
+                        and str(_gv[4]).strip() >= _thirty_ago
+                    ):
+                        _gift_match = _gv
+                        break
+                if _gift_match:
+                    st.session_state["gift_dupe_confirm"] = True
+                    st.session_state["gift_dupe_pending"] = {
+                        "row": row,
+                        "recipient": recipient.strip(),
+                        "match_bags": _gift_match[2],
+                        "match_date": str(_gift_match[4]),
+                        "success_msg": (
+                            f"Logged: {recipient.strip()} · {int(bags)} bags · "
+                            f"{venue.strip()} · {gift_date.isoformat()}"
+                        ),
+                    }
                     st.rerun()
+                else:
+                    with st.spinner("Saving to SharePoint…"):
+                        ok = append_row(st.secrets["GIFTING_FILE_ID"], "GiftingLog", row)
+                    if ok:
+                        st.session_state["g_success"] = (
+                            f"Logged: {recipient.strip()} · {int(bags)} bags · "
+                            f"{venue.strip()} · {gift_date.isoformat()}"
+                        )
+                        st.session_state["g_parsed"] = {}
+                        st.rerun()
 
     # ── MODE: Update Existing Record ──────────────────────────────────────────
     else:
@@ -1010,6 +1072,27 @@ with event_tab:
     if event_mode == "Pre-Event":
         st.markdown("#### Pre-Event Details")
 
+        if st.session_state.get("event_dupe_confirm"):
+            _ed = st.session_state["event_dupe_pending"]
+            st.warning(
+                f"{_ed['venue']} already has an event logged for {_ed['date']}. Log another anyway?"
+            )
+            _ec1, _ec2 = st.columns(2)
+            with _ec1:
+                if st.button("Confirm →", key="event_dupe_confirm_btn"):
+                    with st.spinner("Saving to SharePoint…"):
+                        _ok = append_row(st.secrets["EVENTS_FILE_ID"], "EventLog", _ed["row"])
+                    if _ok:
+                        st.session_state["e_pre_success"] = _ed["success_msg"]
+                        st.session_state["event_dupe_confirm"] = False
+                        st.session_state["event_dupe_pending"] = {}
+                        st.rerun()
+            with _ec2:
+                if st.button("Cancel", key="event_dupe_cancel_btn"):
+                    st.session_state["event_dupe_confirm"] = False
+                    st.session_state["event_dupe_pending"] = {}
+                    st.rerun()
+
         # EventLog columns:
         # Timestamp | Venue | VenueType | EventDate | BagsAllocated | LoggedBy |
         # Sampled | Sold | Leads | Followups | Notes | Status
@@ -1052,13 +1135,35 @@ with event_tab:
                     "",           # Notes
                     "Pre-logged", # Status
                 ]
-                with st.spinner("Saving to SharePoint…"):
-                    ok = append_row(st.secrets["EVENTS_FILE_ID"], "EventLog", row)
-                if ok:
-                    st.session_state["e_pre_success"] = (
-                        f"Pre-logged: {e_venue.strip()} on {e_event_date.isoformat()}"
-                    )
+                with st.spinner("Checking for duplicates…"):
+                    _all_events = get_table_rows(st.secrets["EVENTS_FILE_ID"], "EventLog")
+                _event_match = None
+                for _evr in _all_events:
+                    _ev = (_evr.get("values") or [[]])[0]
+                    if (
+                        len(_ev) > 3
+                        and str(_ev[1]).strip().lower() == e_venue.strip().lower()
+                        and str(_ev[3]).strip() == e_event_date.isoformat()
+                    ):
+                        _event_match = _ev
+                        break
+                if _event_match:
+                    st.session_state["event_dupe_confirm"] = True
+                    st.session_state["event_dupe_pending"] = {
+                        "row": row,
+                        "venue": e_venue.strip(),
+                        "date": e_event_date.isoformat(),
+                        "success_msg": f"Pre-logged: {e_venue.strip()} on {e_event_date.isoformat()}",
+                    }
                     st.rerun()
+                else:
+                    with st.spinner("Saving to SharePoint…"):
+                        ok = append_row(st.secrets["EVENTS_FILE_ID"], "EventLog", row)
+                    if ok:
+                        st.session_state["e_pre_success"] = (
+                            f"Pre-logged: {e_venue.strip()} on {e_event_date.isoformat()}"
+                        )
+                        st.rerun()
 
     # ── Post-Event ────────────────────────────────────────────────────────────
     else:
@@ -1839,6 +1944,34 @@ with capture_tab:
                 _lb_idx = 1 if _mtg_ext.get("logged_by") == "Cameron" else 0
                 _mtg_ext["logged_by"] = st.radio("Logged By", _lb_opts, index=_lb_idx, horizontal=True, key=f"ce_lb_{_cgen}")
 
+            if st.session_state.get("meeting_dupe_confirm"):
+                _mdd = st.session_state["meeting_dupe_pending"]
+                st.warning(
+                    f"A meeting with **{_mdd['venue']}** on **{_mdd['date']}** already exists. Log anyway?"
+                )
+                _mdc1, _mdc2 = st.columns(2)
+                with _mdc1:
+                    if st.button("Confirm →", key=f"mtg_dupe_confirm_btn_{_cgen}"):
+                        with st.spinner("Saving to SharePoint..."):
+                            _ok = append_row(
+                                st.secrets["MEETINGS_FILE_ID"], "MeetingLog",
+                                _mdd["row"], site_id=st.secrets["STRATEGY_SITE_ID"],
+                            )
+                        if _ok:
+                            st.session_state["cap_lead_prompt"] = _mdd["lead_prompt"]
+                            st.session_state["cap_success"] = _mdd["success_msg"]
+                            st.session_state["cap_mtg_extracted"] = None
+                            st.session_state["cap_mtg_list"] = None
+                            st.session_state["meeting_dupe_confirm"] = False
+                            st.session_state["meeting_dupe_pending"] = {}
+                            st.session_state["cap_gen"] += 1
+                            st.rerun()
+                with _mdc2:
+                    if st.button("Cancel", key=f"mtg_dupe_cancel_btn_{_cgen}"):
+                        st.session_state["meeting_dupe_confirm"] = False
+                        st.session_state["meeting_dupe_pending"] = {}
+                        st.rerun()
+
             if st.button("Log to SharePoint →", key=f"cap_mtg_log_{_cgen}"):
                 _fu_str = "; ".join(_mtg_ext.get("follow_up_items") or [])
                 _mtg_row = [
@@ -1866,32 +1999,62 @@ with capture_tab:
                     "pending",
                     str(_mtg_ext.get("logged_by") or "Kolton"),
                 ]
-                with st.spinner("Saving to SharePoint..."):
-                    _ok = append_row(st.secrets["MEETINGS_FILE_ID"], "MeetingLog", _mtg_row,
-                                    site_id=st.secrets["STRATEGY_SITE_ID"])
-                if _ok:
-                    _cap_vtype_map = {
-                        "Medspa": "Medspa", "Recovery Studio": "Recovery Studio",
-                        "Wellness Studio": "Wellness Studio", "Gym": "Performance Gym",
-                        "Corporate": "Corporate", "Hotel": "Hotel", "Event": "Event Space",
-                    }
-                    _cap_fus = _mtg_ext.get("follow_up_items") or []
-                    st.session_state["cap_lead_prompt"] = {
-                        "venue_name": str(_mtg_ext.get("venue_name") or ""),
-                        "contact_name": str(_mtg_ext.get("contact_name") or ""),
-                        "category": _cap_vtype_map.get(str(_mtg_ext.get("venue_type") or ""), "Other"),
-                        "notes": str(_mtg_ext.get("key_insight") or ""),
-                        "next_action": _cap_fus[0].strip() if _cap_fus else "",
-                        "assigned_founder": str(_mtg_ext.get("assigned_founder") or "Kolton"),
-                    }
-                    st.session_state["cap_success"] = (
-                        f"Meeting captured: {_mtg_ext.get('contact_name','—')} - "
-                        f"{_mtg_ext.get('venue_name','—')} (pending confirmation)"
+                _cap_vtype_map = {
+                    "Medspa": "Medspa", "Recovery Studio": "Recovery Studio",
+                    "Wellness Studio": "Wellness Studio", "Gym": "Performance Gym",
+                    "Corporate": "Corporate", "Hotel": "Hotel", "Event": "Event Space",
+                }
+                _cap_fus = _mtg_ext.get("follow_up_items") or []
+                _cap_lead_prompt_data = {
+                    "venue_name": str(_mtg_ext.get("venue_name") or ""),
+                    "contact_name": str(_mtg_ext.get("contact_name") or ""),
+                    "category": _cap_vtype_map.get(str(_mtg_ext.get("venue_type") or ""), "Other"),
+                    "notes": str(_mtg_ext.get("key_insight") or ""),
+                    "next_action": _cap_fus[0].strip() if _cap_fus else "",
+                    "assigned_founder": str(_mtg_ext.get("assigned_founder") or "Kolton"),
+                }
+                _cap_success_msg = (
+                    f"Meeting captured: {_mtg_ext.get('contact_name','—')} - "
+                    f"{_mtg_ext.get('venue_name','—')} (pending confirmation)"
+                )
+                _mtg_venue = str(_mtg_ext.get("venue_name") or "")
+                _mtg_date = str(_mtg_ext.get("meeting_date") or "")
+                with st.spinner("Checking for duplicates..."):
+                    _all_mtgs = get_table_rows(
+                        st.secrets["MEETINGS_FILE_ID"], "MeetingLog",
+                        site_id=st.secrets["STRATEGY_SITE_ID"],
                     )
-                    st.session_state["cap_mtg_extracted"] = None
-                    st.session_state["cap_mtg_list"] = None
-                    st.session_state["cap_gen"] += 1
+                _mtg_match = None
+                for _mr in _all_mtgs:
+                    _mv = (_mr.get("values") or [[]])[0]
+                    if (
+                        len(_mv) > 6
+                        and str(_mv[4]).strip().lower() == _mtg_venue.strip().lower()
+                        and str(_mv[6]).strip() == _mtg_date.strip()
+                    ):
+                        _mtg_match = _mv
+                        break
+                if _mtg_match:
+                    st.session_state["meeting_dupe_confirm"] = True
+                    st.session_state["meeting_dupe_pending"] = {
+                        "row": _mtg_row,
+                        "venue": _mtg_venue,
+                        "date": _mtg_date,
+                        "lead_prompt": _cap_lead_prompt_data,
+                        "success_msg": _cap_success_msg,
+                    }
                     st.rerun()
+                else:
+                    with st.spinner("Saving to SharePoint..."):
+                        _ok = append_row(st.secrets["MEETINGS_FILE_ID"], "MeetingLog", _mtg_row,
+                                        site_id=st.secrets["STRATEGY_SITE_ID"])
+                    if _ok:
+                        st.session_state["cap_lead_prompt"] = _cap_lead_prompt_data
+                        st.session_state["cap_success"] = _cap_success_msg
+                        st.session_state["cap_mtg_extracted"] = None
+                        st.session_state["cap_mtg_list"] = None
+                        st.session_state["cap_gen"] += 1
+                        st.rerun()
 
     # ═══════════════════════════════════════════════════════════════════════
     # VIDEO IDEA CAPTURE
@@ -2012,6 +2175,31 @@ with capture_tab:
                 _vid_ext["action_reasoning"] = st.text_area("Action Reasoning", value=str(_vid_ext.get("action_reasoning") or ""), height=60, key=f"ve_ar_{_cgen}")
                 _vid_ext["content_hook"] = st.text_input("Content Hook", value=str(_vid_ext.get("content_hook") or ""), key=f"ve_hook_{_cgen}")
 
+            if st.session_state.get("video_dupe_confirm"):
+                _vdd = st.session_state["video_dupe_pending"]
+                st.warning("This video URL has already been saved. Save again?")
+                _vdc1, _vdc2 = st.columns(2)
+                with _vdc1:
+                    if st.button("Confirm →", key=f"vid_dupe_confirm_btn_{_cgen}"):
+                        with st.spinner("Saving to SharePoint..."):
+                            _ok = append_row(
+                                st.secrets["VIDEO_FILE_ID"], "VideoIdeas",
+                                _vdd["row"], site_id=st.secrets["STRATEGY_SITE_ID"],
+                            )
+                        if _ok:
+                            st.session_state["cap_success"] = _vdd["success_msg"]
+                            st.session_state["cap_vid_extracted"] = None
+                            st.session_state["cap_vid_show_paste"] = False
+                            st.session_state["video_dupe_confirm"] = False
+                            st.session_state["video_dupe_pending"] = {}
+                            st.session_state["cap_gen"] += 1
+                            st.rerun()
+                with _vdc2:
+                    if st.button("Cancel", key=f"vid_dupe_cancel_btn_{_cgen}"):
+                        st.session_state["video_dupe_confirm"] = False
+                        st.session_state["video_dupe_pending"] = {}
+                        st.rerun()
+
             if st.button("Log to SharePoint →", key=f"cap_vid_log_{_cgen}"):
                 _vid_row = [
                     str(_vid_ext.get("source_url") or ""),
@@ -2031,18 +2219,39 @@ with capture_tab:
                     _vid_ext.get("timestamp", datetime.now().isoformat(timespec="seconds")),
                     str(_vid_ext.get("saved_by") or "Kolton"),
                 ]
-                with st.spinner("Saving to SharePoint..."):
-                    _ok = append_row(st.secrets["VIDEO_FILE_ID"], "VideoIdeas", _vid_row,
-                                    site_id=st.secrets["STRATEGY_SITE_ID"])
-                if _ok:
-                    st.session_state["cap_success"] = (
-                        f"Video captured: {_vid_ext.get('platform','')} - "
-                        f"{_vid_ext.get('creator_handle') or 'unknown'} (pending confirmation)"
+                _vid_src_url = str(_vid_ext.get("source_url") or "")
+                _vid_success_msg = (
+                    f"Video captured: {_vid_ext.get('platform','')} - "
+                    f"{_vid_ext.get('creator_handle') or 'unknown'} (pending confirmation)"
+                )
+                with st.spinner("Checking for duplicates..."):
+                    _all_vids = get_table_rows(
+                        st.secrets["VIDEO_FILE_ID"], "VideoIdeas",
+                        site_id=st.secrets["STRATEGY_SITE_ID"],
                     )
-                    st.session_state["cap_vid_extracted"] = None
-                    st.session_state["cap_vid_show_paste"] = False
-                    st.session_state["cap_gen"] += 1
+                _vid_match = False
+                for _vr in _all_vids:
+                    _vv = (_vr.get("values") or [[]])[0]
+                    if _vv and str(_vv[0]).strip() == _vid_src_url.strip():
+                        _vid_match = True
+                        break
+                if _vid_match:
+                    st.session_state["video_dupe_confirm"] = True
+                    st.session_state["video_dupe_pending"] = {
+                        "row": _vid_row,
+                        "success_msg": _vid_success_msg,
+                    }
                     st.rerun()
+                else:
+                    with st.spinner("Saving to SharePoint..."):
+                        _ok = append_row(st.secrets["VIDEO_FILE_ID"], "VideoIdeas", _vid_row,
+                                        site_id=st.secrets["STRATEGY_SITE_ID"])
+                    if _ok:
+                        st.session_state["cap_success"] = _vid_success_msg
+                        st.session_state["cap_vid_extracted"] = None
+                        st.session_state["cap_vid_show_paste"] = False
+                        st.session_state["cap_gen"] += 1
+                        st.rerun()
 
     # ═══════════════════════════════════════════════════════════════════════
     # PENDING QUEUE
@@ -2372,50 +2581,118 @@ with finance_tab:
                 f"FINANCE_SUMMARY_FILE_ID={_fin_sum_fid!r} | "
                 f"tables: FinanceLog, FinanceSummary"
             )
+
+            if st.session_state.get("finance_dupe_confirm"):
+                _fdd = st.session_state["finance_dupe_pending"]
+                st.warning(f"{_fdd['month']} has already been submitted. Submit again?")
+                _fdc1, _fdc2 = st.columns(2)
+                with _fdc1:
+                    if st.button("Confirm →", key="fin_dupe_confirm_btn"):
+                        _ts = datetime.now().isoformat(timespec="seconds")
+                        _month = _fin_parsed["statement_month"]
+                        _errs = 0
+                        with st.spinner("Writing to SharePoint..."):
+                            for _, _row in _edited.iterrows():
+                                _conf_clean = (
+                                    str(_row["Confidence"])
+                                    .replace("🟢 ", "").replace("🟡 ", "").replace("🔴 ", "")
+                                )
+                                _txn_vals = [
+                                    _ts, _month,
+                                    str(_row["Date"]),
+                                    str(_row["Description"]),
+                                    float(_row["Amount"]),
+                                    str(_row["Type"]),
+                                    str(_row["Category"]),
+                                    _conf_clean,
+                                    _fin_logger,
+                                    "",
+                                    "pending_approval",
+                                    str(_row["Notes"]),
+                                ]
+                                if not append_row(_fin_fid, "FinanceLog", _txn_vals, site_id=_fin_sid):
+                                    _errs += 1
+                            if _fin_sum_fid:
+                                append_row(_fin_sum_fid, "FinanceSummary", [
+                                    _ts, _month,
+                                    _fin_parsed["beginning_balance"],
+                                    _fin_parsed["ending_balance"],
+                                    _total_credits, abs(_total_debits), _net,
+                                    len(_fin_cats), _fin_logger, "pending_approval",
+                                ], site_id=_fin_sid)
+                        if _errs == 0:
+                            st.session_state["finance_dupe_confirm"] = False
+                            st.session_state["finance_dupe_pending"] = {}
+                            st.success(f"Submitted: {_month} — {len(_fin_cats)} transactions pending approval")
+                            st.balloons()
+                            st.session_state["fin_parsed"] = None
+                            st.session_state["fin_categorized"] = None
+                            st.rerun()
+                        else:
+                            st.warning(f"{_errs} row(s) failed to write.")
+                with _fdc2:
+                    if st.button("Cancel", key="fin_dupe_cancel_btn"):
+                        st.session_state["finance_dupe_confirm"] = False
+                        st.session_state["finance_dupe_pending"] = {}
+                        st.rerun()
+
             if st.button("Submit for Approval →", key="fin_submit_btn"):
                 if not _fin_fid:
                     st.error("FINANCE_FILE_ID not configured in secrets.")
                 else:
                     _ts = datetime.now().isoformat(timespec="seconds")
                     _month = _fin_parsed["statement_month"]
-                    _errs = 0
-                    with st.spinner("Writing to SharePoint..."):
-                        for _, _row in _edited.iterrows():
-                            _conf_clean = (
-                                str(_row["Confidence"])
-                                .replace("🟢 ", "").replace("🟡 ", "").replace("🔴 ", "")
-                            )
-                            _txn_vals = [
-                                _ts, _month,
-                                str(_row["Date"]),
-                                str(_row["Description"]),
-                                float(_row["Amount"]),
-                                str(_row["Type"]),
-                                str(_row["Category"]),
-                                _conf_clean,
-                                _fin_logger,
-                                "",
-                                "pending_approval",
-                                str(_row["Notes"]),
-                            ]
-                            if not append_row(_fin_fid, "FinanceLog", _txn_vals, site_id=_fin_sid):
-                                _errs += 1
-                        if _fin_sum_fid:
-                            append_row(_fin_sum_fid, "FinanceSummary", [
-                                _ts, _month,
-                                _fin_parsed["beginning_balance"],
-                                _fin_parsed["ending_balance"],
-                                _total_credits, abs(_total_debits), _net,
-                                len(_fin_cats), _fin_logger, "pending_approval",
-                            ], site_id=_fin_sid)
-                    if _errs == 0:
-                        st.success(f"Submitted: {_month} — {len(_fin_cats)} transactions pending approval")
-                        st.balloons()
-                        st.session_state["fin_parsed"] = None
-                        st.session_state["fin_categorized"] = None
+                    with st.spinner("Checking for duplicates..."):
+                        _fin_sum_rows = get_table_rows(_fin_sum_fid, "FinanceSummary", site_id=_fin_sid) if _fin_sum_fid else []
+                    _fin_month_match = False
+                    for _fr in _fin_sum_rows:
+                        _fv = (_fr.get("values") or [[]])[0]
+                        if len(_fv) > 1 and str(_fv[1]).strip() == _month.strip():
+                            _fin_month_match = True
+                            break
+                    if _fin_month_match:
+                        st.session_state["finance_dupe_confirm"] = True
+                        st.session_state["finance_dupe_pending"] = {"month": _month}
                         st.rerun()
                     else:
-                        st.warning(f"{_errs} row(s) failed to write.")
+                        _errs = 0
+                        with st.spinner("Writing to SharePoint..."):
+                            for _, _row in _edited.iterrows():
+                                _conf_clean = (
+                                    str(_row["Confidence"])
+                                    .replace("🟢 ", "").replace("🟡 ", "").replace("🔴 ", "")
+                                )
+                                _txn_vals = [
+                                    _ts, _month,
+                                    str(_row["Date"]),
+                                    str(_row["Description"]),
+                                    float(_row["Amount"]),
+                                    str(_row["Type"]),
+                                    str(_row["Category"]),
+                                    _conf_clean,
+                                    _fin_logger,
+                                    "",
+                                    "pending_approval",
+                                    str(_row["Notes"]),
+                                ]
+                                if not append_row(_fin_fid, "FinanceLog", _txn_vals, site_id=_fin_sid):
+                                    _errs += 1
+                            if _fin_sum_fid:
+                                append_row(_fin_sum_fid, "FinanceSummary", [
+                                    _ts, _month,
+                                    _fin_parsed["beginning_balance"],
+                                    _fin_parsed["ending_balance"],
+                                    _total_credits, abs(_total_debits), _net,
+                                    len(_fin_cats), _fin_logger, "pending_approval",
+                                ], site_id=_fin_sid)
+                        if _errs == 0:
+                            st.success(f"Submitted: {_month} — {len(_fin_cats)} transactions pending approval")
+                            st.balloons()
+                            st.session_state["fin_parsed"] = None
+                            st.session_state["fin_categorized"] = None
+                            st.rerun()
+                        else:
+                            st.warning(f"{_errs} row(s) failed to write.")
 
     # ── Section E: Approval Queue ─────────────────────────────────────────────
     st.markdown("---")
@@ -2649,6 +2926,35 @@ with sales_tab:
     st.markdown("---")
 
     # ── Section D — Save ──────────────────────────────────────────────────────
+    if st.session_state.get("sales_dupe_confirm"):
+        _sdd = st.session_state["sales_dupe_pending"]
+        st.warning(
+            f"A record for **{_sdd['venue_name']}** already exists at stage **{_sdd['stage']}**. Save anyway?"
+        )
+        _sdc1, _sdc2 = st.columns(2)
+        with _sdc1:
+            if st.button("Confirm →", key=f"sales_dupe_confirm_btn_{_sgen}"):
+                with st.spinner("Saving to SharePoint…"):
+                    _ok = append_row(
+                        st.secrets["SALES_FILE_ID"],
+                        "SalesLeads",
+                        _sdd["values"],
+                        site_id=st.secrets["SALES_SITE_ID"],
+                    )
+                if _ok:
+                    st.session_state["sales_success"] = _sdd["success_msg"]
+                    st.session_state["sales_prefill"] = {}
+                    st.session_state["sales_dupe_confirm"] = False
+                    st.session_state["sales_dupe_pending"] = {}
+                    st.session_state["sales_gen"] += 1
+                    st.balloons()
+                    st.rerun()
+        with _sdc2:
+            if st.button("Cancel", key=f"sales_dupe_cancel_btn_{_sgen}"):
+                st.session_state["sales_dupe_confirm"] = False
+                st.session_state["sales_dupe_pending"] = {}
+                st.rerun()
+
     if st.button(f"Save {_sales_type} →", key=f"sales_save_{_sgen}"):
         if not _venue_name.strip():
             st.error("Venue Name is required.")
@@ -2682,18 +2988,39 @@ with sales_tab:
                 int(_fit_score),
                 _franchise,
             ]
-            with st.spinner("Saving to SharePoint…"):
-                _ok = append_row(
-                    st.secrets["SALES_FILE_ID"],
-                    "SalesLeads",
-                    _values,
+            with st.spinner("Checking for duplicates…"):
+                _all_leads = get_table_rows(
+                    st.secrets["SALES_FILE_ID"], "SalesLeads",
                     site_id=st.secrets["SALES_SITE_ID"],
                 )
-            if _ok:
-                st.session_state["sales_success"] = (
-                    f"Saved: {_venue_name.strip()} — {_stage} — {_sales_type}"
-                )
-                st.session_state["sales_prefill"] = {}
-                st.session_state["sales_gen"] += 1
-                st.balloons()
+            _sales_match = None
+            for _lr in _all_leads:
+                _lv = (_lr.get("values") or [[]])[0]
+                if len(_lv) > 1 and str(_lv[1]).strip().lower() == _venue_name.strip().lower():
+                    _sales_match = _lv
+                    break
+            if _sales_match:
+                st.session_state["sales_dupe_confirm"] = True
+                st.session_state["sales_dupe_pending"] = {
+                    "values": _values,
+                    "venue_name": _venue_name.strip(),
+                    "stage": str(_sales_match[3]) if len(_sales_match) > 3 else "",
+                    "success_msg": f"Saved: {_venue_name.strip()} — {_stage} — {_sales_type}",
+                }
                 st.rerun()
+            else:
+                with st.spinner("Saving to SharePoint…"):
+                    _ok = append_row(
+                        st.secrets["SALES_FILE_ID"],
+                        "SalesLeads",
+                        _values,
+                        site_id=st.secrets["SALES_SITE_ID"],
+                    )
+                if _ok:
+                    st.session_state["sales_success"] = (
+                        f"Saved: {_venue_name.strip()} — {_stage} — {_sales_type}"
+                    )
+                    st.session_state["sales_prefill"] = {}
+                    st.session_state["sales_gen"] += 1
+                    st.balloons()
+                    st.rerun()
