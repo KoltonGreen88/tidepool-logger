@@ -2363,17 +2363,18 @@ with finance_tab:
         with _pdfplumber.open(pdf_file) as _pdf:
             _full_text = "\n".join(_page.extract_text() or "" for _page in _pdf.pages)
 
-        # Statement month
+        # Statement month — matches both:
+        #   "January 2026 (Jan. 1, 2026 - Jan. 31, 2026)"
+        #   "Statement Period: January 2026"
         statement_month = ""
         _pm = _re.search(
-            r'Statement Period.*?(\w+\.?\s+\d{1,2},?\s*\d{4})',
+            r'(?:Statement\s+Period[:\s]+)?'
+            r'(January|February|March|April|May|June|July|August'
+            r'|September|October|November|December)\s+(20\d{2})',
             _full_text, _re.IGNORECASE
         )
         if _pm:
-            try:
-                statement_month = dateparser.parse(_pm.group(1)).strftime("%B %Y")
-            except Exception:
-                statement_month = _pm.group(1)
+            statement_month = f"{_pm.group(1).title()} {_pm.group(2)}"
 
         # Balances — amount may be on the same line or the next non-empty line
         beg_bal = end_bal = 0.0
