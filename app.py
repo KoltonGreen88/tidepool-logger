@@ -331,7 +331,14 @@ def parse_with_ai(text: str) -> dict:
             }
         ],
     )
-    raw = msg.content[0].text.strip()
+    if not msg.content:
+        st.error("AI parse returned empty response — fill manually")
+        return {}
+    try:
+        raw = msg.content[0].text.strip()
+    except (IndexError, AttributeError):
+        st.error("AI parse returned empty response — fill manually")
+        return {}
     # Strip markdown code fences if Claude wraps them
     if "```" in raw:
         parts = raw.split("```")
