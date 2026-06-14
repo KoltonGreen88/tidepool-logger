@@ -688,6 +688,10 @@ _DEFAULTS = {
     "finance_dupe_pending": {},
     "video_dupe_confirm": False,
     "video_dupe_pending": {},
+    "social_success": "",
+    "social_dupe_confirm": False,
+    "social_dupe_pending": {},
+    "social_insights_dupe_confirm": False,
 }
 for _k, _v in _DEFAULTS.items():
     if _k not in st.session_state:
@@ -767,7 +771,7 @@ _ai_call_count = len(st.session_state.get("api_call_log", []))
 st.sidebar.caption(f"AI calls this session: {_ai_call_count}/50")
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
-gifting_tab, event_tab, creator_tab, capture_tab, finance_tab, sales_tab = st.tabs(["Gifting Log", "Event Wrap-Up", "Creator Applications", "📥 Capture Review", "💰 Finance", "🤝 Sales"])
+gifting_tab, event_tab, creator_tab, capture_tab, finance_tab, sales_tab, social_tab = st.tabs(["Gifting Log", "Event Wrap-Up", "Creator Applications", "📥 Capture Review", "💰 Finance", "🤝 Sales", "📊 Social"])
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -3030,3 +3034,402 @@ with sales_tab:
                     st.session_state["sales_gen"] += 1
                     st.balloons()
                     st.rerun()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SOCIAL TAB
+# ═══════════════════════════════════════════════════════════════════════════════
+with social_tab:
+    import base64 as _si_b64
+    import re as _si_re
+    import io as _si_io
+    import pandas as _soc_pd
+    from streamlit_paste_button import paste_image_button as pbutton
+
+    _si_fid       = st.secrets.get("SOCIAL_FILE_ID",       "paste-your-value-here")
+    _si_posts_fid = st.secrets.get("SOCIAL_POSTS_FILE_ID", "paste-your-value-here")
+    _si_sid       = st.secrets.get("SHAREPOINT_SITE_ID") or None
+
+    if st.session_state["social_success"]:
+        st.success(st.session_state["social_success"])
+        st.session_state["social_success"] = ""
+
+    st.markdown("### 📊 Social")
+
+    # ════════════════════════════════════════════════════════════════════════════
+    # SECTION A — MONTHLY INSIGHTS
+    # ════════════════════════════════════════════════════════════════════════════
+    st.markdown("#### Monthly Insights")
+
+    # ── Dupe confirmation ─────────────────────────────────────────────────────
+    if st.session_state.get("social_insights_dupe_confirm"):
+        _sdd = st.session_state["social_dupe_pending"]
+        st.warning(f"{_sdd['month']} insights already logged. Save anyway?")
+        _sdc1, _sdc2 = st.columns(2)
+        with _sdc1:
+            if st.button("Confirm →", key="si_dupe_confirm_btn"):
+                with st.spinner("Saving to SharePoint..."):
+                    _ok = append_row(_si_fid, "SocialInsights", _sdd["row"], site_id=_si_sid)
+                if _ok:
+                    _sr = _sdd["row"]
+                    st.session_state["social_success"] = (
+                        f"Logged: {_sdd['month']} insights — "
+                        f"Views {_sr[2]:,}, Reach {_sr[3]:,}, Follows {_sr[7]:,}"
+                    )
+                    st.session_state.pop("si_extracted", None)
+                    st.session_state.pop("si_extract_ok", None)
+                    st.session_state["si_last_file_key"] = st.session_state.get("si_cur_file_key", "")
+                    st.session_state["social_insights_dupe_confirm"] = False
+                    st.session_state["social_dupe_pending"] = {}
+                    st.rerun()
+        with _sdc2:
+            if st.button("Cancel", key="si_dupe_cancel_btn"):
+                st.session_state["social_insights_dupe_confirm"] = False
+                st.session_state["social_dupe_pending"] = {}
+                st.rerun()
+
+    # ── Screenshot upload ─────────────────────────────────────────────────────
+    _si_paste = pbutton("📋 Paste screenshot from clipboard", key="si_paste_btn")
+
+    st.caption("or upload file")
+    _si_imgs = st.file_uploader(
+        "Insights screenshot(s) (Views, Reach, Interactions, Link Clicks, Visits, Follows)",
+        type=["png", "jpg", "jpeg"],
+        accept_multiple_files=True,
+        key="si_img_upload",
+        label_visibility="collapsed",
+    )
+
+    # Build a unified list of (bytes, mime) from whichever source provided images
+    _si_image_sources: list[tuple[bytes, str]] = []
+    if _si_paste.image_data is not None:
+        _pil_buf = _si_io.BytesIO()
+        _si_paste.image_data.save(_pil_buf, format="PNG")
+        _si_image_sources = [(_pil_buf.getvalue(), "image/png")]
+    elif _si_imgs:
+        for _img in _si_imgs:
+            _img_bytes = _img.read()
+            _mime = "image/png" if _img.name.lower().endswith(".png") else "image/jpeg"
+            _si_image_sources.append((_img_bytes, _mime))
+
+    _si_cur_key = (
+        "paste:" + str(hash(_si_image_sources[0][0])) if _si_paste.image_data is not None
+        else "|".join(f"{f.name}:{f.size}" for f in _si_imgs) if _si_imgs
+        else ""
+    )
+    st.session_state["si_cur_file_key"] = _si_cur_key
+
+    _si_extracted  = st.session_state.get("si_extracted")
+    _si_extract_ok = st.session_state.get("si_extract_ok", False)
+
+    if not _si_image_sources and _si_extracted is not None:
+        st.session_state.pop("si_extracted", None)
+        st.session_state.pop("si_extract_ok", None)
+        st.session_state["si_last_file_key"] = ""
+        _si_extracted  = None
+        _si_extract_ok = False
+
+    if _si_image_sources and _si_cur_key != st.session_state.get("si_last_file_key", ""):
+        if check_rate_limit():
+            with st.spinner("Extracting metrics from screenshot..."):
+                try:
+                    _si_content = []
+                    for _img_bytes, _mime in _si_image_sources:
+                        _si_content.append({
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": _mime,
+                                "data": _si_b64.b64encode(_img_bytes).decode(),
+                            },
+                        })
+                    if len(_si_image_sources) == 1:
+                        _si_prompt = (
+                            "This is a screenshot from Meta Business Suite Instagram Insights showing "
+                            "performance metrics. Extract these six values as integers (convert K notation "
+                            "like 2.3K to 2300, remove commas): Views, Reach, ContentInteractions (labeled "
+                            "Content interactions), LinkClicks (labeled Link clicks or Instagram link "
+                            "clicks), ProfileVisits (labeled Visits or Instagram profile visits), "
+                            "NewFollows (labeled Follows or Instagram follows). Also extract the date range "
+                            "shown if visible (e.g. May 1 - May 31 or Jun 1 - Jun 13). Return ONLY a JSON "
+                            "object with keys: views, reach, content_interactions, link_clicks, "
+                            "profile_visits, new_follows, date_range_text. Use null for any value not "
+                            "visible in the image."
+                        )
+                    else:
+                        _si_prompt = (
+                            "These are multiple screenshots from the same Instagram Insights period. "
+                            "Extract and combine metric values across all screenshots. If a metric appears "
+                            "in multiple screenshots, use the most clearly labeled value. For the date "
+                            "range use the widest range found. Extract: Views, Reach, ContentInteractions "
+                            "(labeled Content interactions), LinkClicks (labeled Link clicks or Instagram "
+                            "link clicks), ProfileVisits (labeled Visits or Instagram profile visits), "
+                            "NewFollows (labeled Follows or Instagram follows). Convert K notation like "
+                            "2.3K to 2300, remove commas. Return ONLY a JSON object with keys: views, "
+                            "reach, content_interactions, link_clicks, profile_visits, new_follows, "
+                            "date_range_text. Use null for any value not found."
+                        )
+                    _si_content.append({"type": "text", "text": _si_prompt})
+                    _si_ac = anthropic.Anthropic(api_key=st.secrets["ANTHROPIC_API_KEY"])
+                    _si_msg = _si_ac.messages.create(
+                        model="claude-sonnet-4-5",
+                        max_tokens=512,
+                        messages=[{"role": "user", "content": _si_content}],
+                    )
+                    _si_raw = _si_msg.content[0].text.strip()
+                    if "```" in _si_raw:
+                        _si_parts = _si_raw.split("```")
+                        _si_raw = _si_parts[1] if len(_si_parts) > 1 else _si_raw
+                        if _si_raw.lower().startswith("json"):
+                            _si_raw = _si_raw[4:].strip()
+                    _si_result = json.loads(_si_raw)
+                    _si_all_null = all(
+                        _si_result.get(k) is None
+                        for k in ["views", "reach", "content_interactions",
+                                  "link_clicks", "profile_visits", "new_follows"]
+                    )
+                    st.session_state["si_extracted"]     = _si_result
+                    st.session_state["si_extract_ok"]    = not _si_all_null
+                    st.session_state["si_last_file_key"] = _si_cur_key
+                    _si_extracted  = _si_result
+                    _si_extract_ok = not _si_all_null
+                    st.rerun()
+                except Exception as _si_exc:
+                    st.session_state["si_extracted"]     = {}
+                    st.session_state["si_extract_ok"]    = False
+                    st.session_state["si_last_file_key"] = _si_cur_key
+                    _si_extracted  = {}
+                    _si_extract_ok = False
+                    st.warning(
+                        f"Could not read values from screenshot — enter manually below. ({_si_exc})"
+                    )
+
+    if _si_extracted is not None:
+        if _si_extract_ok:
+            st.markdown(
+                '<div style="background:#1D9E75; border-radius:8px; padding:10px 16px; '
+                'margin-bottom:8px; color:white; font-size:14px; font-weight:600;">'
+                "Extracted from screenshot — review and confirm before saving."
+                "</div>",
+                unsafe_allow_html=True,
+            )
+        else:
+            st.warning("Could not read values from screenshot — enter manually below.")
+
+    _SI_MONTHS = {
+        "jan": "January", "feb": "February", "mar": "March", "apr": "April",
+        "may": "May",     "jun": "June",      "jul": "July",  "aug": "August",
+        "sep": "September", "oct": "October", "nov": "November", "dec": "December",
+    }
+
+    def _si_infer_month(date_range_text) -> str:
+        _default = datetime.now().strftime("%B %Y")
+        if not date_range_text:
+            return _default
+        _tl = str(date_range_text).lower()
+        _yr = datetime.now().year
+        _ym = _si_re.search(r'\b(20\d{2})\b', _tl)
+        if _ym:
+            _yr = int(_ym.group(1))
+        _found = None
+        for _abbr, _full in _SI_MONTHS.items():
+            if _abbr in _tl or _full.lower() in _tl:
+                _found = _full
+        return f"{_found} {_yr}" if _found else _default
+
+    def _si_int(val, fallback: int = 0) -> int:
+        try:
+            return int(val) if val is not None else fallback
+        except Exception:
+            return fallback
+
+    _si_ex            = _si_extracted or {}
+    _si_month_default = _si_infer_month(_si_ex.get("date_range_text"))
+
+    with st.form("si_insights_form", clear_on_submit=True):
+        _si_month = st.text_input("Month",                  value=_si_month_default)
+        _si_views = st.number_input("Views",                min_value=0, value=_si_int(_si_ex.get("views")))
+        _si_reach = st.number_input("Reach",                min_value=0, value=_si_int(_si_ex.get("reach")))
+        _si_ci    = st.number_input("Content Interactions", min_value=0, value=_si_int(_si_ex.get("content_interactions")))
+        _si_lc    = st.number_input("Link Clicks",          min_value=0, value=_si_int(_si_ex.get("link_clicks")))
+        _si_pv    = st.number_input("Profile Visits",       min_value=0, value=_si_int(_si_ex.get("profile_visits")))
+        _si_nf    = st.number_input("New Follows",          min_value=0, value=_si_int(_si_ex.get("new_follows")))
+        _si_lb    = st.radio("Logged By", ["Kolton", "Cameron"], horizontal=True, key="si_insights_lb")
+        _si_submit = st.form_submit_button("Save Insights")
+
+    if _si_submit and not st.session_state.get("social_insights_dupe_confirm"):
+        if not _si_month.strip():
+            st.error("Month is required.")
+        elif _si_fid in ("paste-your-value-here", ""):
+            st.error("SOCIAL_FILE_ID not configured in secrets.")
+        else:
+            _si_row = [
+                datetime.now().isoformat(timespec="seconds"),
+                _si_month.strip(),
+                int(_si_views),
+                int(_si_reach),
+                int(_si_ci),
+                int(_si_lc),
+                int(_si_pv),
+                int(_si_nf),
+                _si_lb,
+            ]
+            with st.spinner("Checking for existing entry..."):
+                _si_existing = get_table_rows(_si_fid, "SocialInsights", site_id=_si_sid)
+            _si_match = None
+            for _sir in _si_existing:
+                _siv = (_sir.get("values") or [[]])[0]
+                if len(_siv) > 1 and str(_siv[1]).strip().lower() == _si_month.strip().lower():
+                    _si_match = _siv
+                    break
+            if _si_match:
+                st.session_state["social_insights_dupe_confirm"] = True
+                st.session_state["social_dupe_pending"] = {
+                    "row": _si_row,
+                    "month": _si_month.strip(),
+                }
+                st.rerun()
+            else:
+                with st.spinner("Saving to SharePoint..."):
+                    _ok = append_row(_si_fid, "SocialInsights", _si_row, site_id=_si_sid)
+                if _ok:
+                    st.session_state["social_success"] = (
+                        f"Logged: {_si_month.strip()} insights — "
+                        f"Views {int(_si_views):,}, Reach {int(_si_reach):,}, "
+                        f"Follows {int(_si_nf):,}"
+                    )
+                    st.session_state.pop("si_extracted", None)
+                    st.session_state.pop("si_extract_ok", None)
+                    st.session_state["si_last_file_key"] = _si_cur_key
+                    st.rerun()
+
+    # ════════════════════════════════════════════════════════════════════════════
+    # SECTION B — PER-POST CONTENT DATA
+    # ════════════════════════════════════════════════════════════════════════════
+    st.markdown("---")
+    st.markdown("#### Per-Post Content Data")
+
+    _sp_csv = st.file_uploader(
+        "Upload Instagram Content export (per-post data)",
+        type=["csv"],
+        key="si_posts_csv",
+    )
+
+    _sp_cur_key = f"{_sp_csv.name}:{_sp_csv.size}" if _sp_csv is not None else ""
+    _sp_parsed  = st.session_state.get("si_posts_parsed")
+
+    if not _sp_csv and _sp_parsed is not None:
+        st.session_state.pop("si_posts_parsed",   None)
+        st.session_state.pop("si_posts_file_key", None)
+        _sp_parsed = None
+
+    if _sp_csv is not None and st.session_state.get("si_posts_file_key", "") != _sp_cur_key:
+        try:
+            _sp_df_raw = _soc_pd.read_csv(_sp_csv)
+            _sp_df_raw.columns = [c.strip() for c in _sp_df_raw.columns]
+
+            def _sp_col(df, *names):
+                _cl = {c.lower(): c for c in df.columns}
+                for n in names:
+                    if n.lower() in _cl:
+                        return _cl[n.lower()]
+                return None
+
+            def _sp_str_col(df, col):
+                if col is None:
+                    return _soc_pd.Series([""] * len(df), index=df.index)
+                return df[col].fillna("").astype(str).str.strip()
+
+            def _sp_int_col(df, col):
+                if col is None:
+                    return _soc_pd.Series([0] * len(df), index=df.index)
+                return _soc_pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
+
+            _sp_out = _soc_pd.DataFrame()
+            _sp_out["PostID"]          = _sp_str_col(_sp_df_raw, _sp_col(_sp_df_raw, "Post ID",          "postid",    "id"))
+            _sp_out["AccountUsername"] = _sp_str_col(_sp_df_raw, _sp_col(_sp_df_raw, "Account username", "username",  "account"))
+            _sp_out["PostType"]        = _sp_str_col(_sp_df_raw, _sp_col(_sp_df_raw, "Post type",        "posttype",  "type"))
+            _sp_out["PublishTime"]     = _sp_str_col(_sp_df_raw, _sp_col(_sp_df_raw, "Publish time",     "published", "date"))
+            _sp_out["Permalink"]       = _sp_str_col(_sp_df_raw, _sp_col(_sp_df_raw, "Permalink",        "link",      "url"))
+            _sp_out["Views"]           = _sp_int_col(_sp_df_raw, _sp_col(_sp_df_raw, "Views",            "impressions"))
+            _sp_out["Likes"]           = _sp_int_col(_sp_df_raw, _sp_col(_sp_df_raw, "Likes"))
+            _sp_out["Shares"]          = _sp_int_col(_sp_df_raw, _sp_col(_sp_df_raw, "Shares"))
+            _sp_out["Comments"]        = _sp_int_col(_sp_df_raw, _sp_col(_sp_df_raw, "Comments"))
+            _sp_out["Saves"]           = _sp_int_col(_sp_df_raw, _sp_col(_sp_df_raw, "Saves"))
+            _sp_out["Reach"]           = _sp_int_col(_sp_df_raw, _sp_col(_sp_df_raw, "Reach",            "accounts reached"))
+            _sp_out["Follows"]         = _sp_int_col(_sp_df_raw, _sp_col(_sp_df_raw, "Follows"))
+
+            _sp_parsed = _sp_out.to_dict("records")
+            st.session_state["si_posts_parsed"]   = _sp_parsed
+            st.session_state["si_posts_file_key"] = _sp_cur_key
+        except Exception as _sp_exc:
+            st.error(f"CSV parse error: {_sp_exc}")
+            _sp_parsed = None
+
+    if _sp_parsed:
+        _sp_existing_ids: set = set()
+        if _si_posts_fid not in ("paste-your-value-here", ""):
+            with st.spinner("Checking existing posts..."):
+                _sp_existing_rows = get_table_rows(_si_posts_fid, "SocialPosts", site_id=_si_sid)
+            for _spr in _sp_existing_rows:
+                _spv = (_spr.get("values") or [[]])[0]
+                if len(_spv) > 1:
+                    _sp_existing_ids.add(str(_spv[1]).strip())
+
+        _sp_new   = [p for p in _sp_parsed if p["PostID"] not in _sp_existing_ids]
+        _sp_dupes = [p for p in _sp_parsed if p["PostID"]     in _sp_existing_ids]
+
+        _sp_preview_df = _soc_pd.DataFrame([{
+            "Post ID":      p["PostID"],
+            "Account":      p["AccountUsername"],
+            "Type":         p["PostType"],
+            "Publish Time": p["PublishTime"],
+            "Views":        p["Views"],
+            "Reach":        p["Reach"],
+            "Likes":        p["Likes"],
+            "Comments":     p["Comments"],
+            "Saves":        p["Saves"],
+            "Follows":      p["Follows"],
+        } for p in _sp_parsed])
+        st.dataframe(_sp_preview_df, use_container_width=True, hide_index=True)
+        st.caption(f"{len(_sp_new)} new post(s), {len(_sp_dupes)} duplicate(s) will be skipped.")
+
+        _sp_lb = st.radio("Logged By", ["Kolton", "Cameron"], horizontal=True, key="si_posts_lb")
+
+        if st.button("Log Posts to SharePoint", key="si_posts_submit"):
+            if _si_posts_fid in ("paste-your-value-here", ""):
+                st.error("SOCIAL_POSTS_FILE_ID not configured in secrets.")
+            elif not _sp_new:
+                st.warning("No new posts to log — all are duplicates.")
+            else:
+                _sp_errs = 0
+                _sp_ts = datetime.now().isoformat(timespec="seconds")
+                with st.spinner("Logging posts..."):
+                    for _p in _sp_new:
+                        _sp_row = [
+                            _sp_ts,
+                            _p["PostID"],
+                            _p["AccountUsername"],
+                            _p["PostType"],
+                            _p["PublishTime"],
+                            _p["Permalink"],
+                            _p["Views"],
+                            _p["Likes"],
+                            _p["Shares"],
+                            _p["Comments"],
+                            _p["Saves"],
+                            _p["Reach"],
+                            _p["Follows"],
+                            _sp_lb,
+                        ]
+                        if not append_row(_si_posts_fid, "SocialPosts", _sp_row, site_id=_si_sid):
+                            _sp_errs += 1
+                if _sp_errs == 0:
+                    st.session_state["social_success"] = (
+                        f"Logged {len(_sp_new)} post(s) — {len(_sp_dupes)} duplicate(s) skipped."
+                    )
+                    st.session_state.pop("si_posts_parsed",   None)
+                    st.session_state.pop("si_posts_file_key", None)
+                    st.rerun()
+                else:
+                    st.warning(f"{_sp_errs} post(s) failed to write.")

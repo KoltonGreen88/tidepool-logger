@@ -3,3 +3,4 @@ requests
 anthropic
 python-dateutil
 pdfplumber
+streamlit-paste-button
