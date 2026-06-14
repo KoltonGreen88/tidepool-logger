@@ -3367,6 +3367,13 @@ with social_tab:
             _sp_parsed = None
 
     if _sp_parsed:
+        # Normalize a PostID value to string regardless of whether Excel/CSV gives int/float/str
+        def _sp_norm_id(x) -> str:
+            try:
+                return str(int(float(str(x).strip())))
+            except (ValueError, TypeError):
+                return str(x).strip()
+
         _sp_existing_ids: set = set()
         if _si_posts_fid not in ("paste-your-value-here", ""):
             with st.spinner("Checking existing posts..."):
@@ -3374,10 +3381,10 @@ with social_tab:
             for _spr in _sp_existing_rows:
                 _spv = (_spr.get("values") or [[]])[0]
                 if len(_spv) > 1:
-                    _sp_existing_ids.add(str(_spv[1]).strip())
+                    _sp_existing_ids.add(_sp_norm_id(_spv[1]))
 
-        _sp_new   = [p for p in _sp_parsed if p["PostID"] not in _sp_existing_ids]
-        _sp_dupes = [p for p in _sp_parsed if p["PostID"]     in _sp_existing_ids]
+        _sp_new   = [p for p in _sp_parsed if _sp_norm_id(p["PostID"]) not in _sp_existing_ids]
+        _sp_dupes = [p for p in _sp_parsed if _sp_norm_id(p["PostID"])     in _sp_existing_ids]
 
         _sp_preview_df = _soc_pd.DataFrame([{
             "Post ID":      p["PostID"],
@@ -3408,7 +3415,7 @@ with social_tab:
                     for _p in _sp_new:
                         _sp_row = [
                             _sp_ts,
-                            _p["PostID"],
+                            str(_sp_norm_id(_p["PostID"])),  # always string to avoid scientific notation
                             _p["AccountUsername"],
                             _p["PostType"],
                             _p["PublishTime"],
@@ -3424,12 +3431,63 @@ with social_tab:
                         ]
                         if not append_row(_si_posts_fid, "SocialPosts", _sp_row, site_id=_si_sid):
                             _sp_errs += 1
-                if _sp_errs == 0:
+
+                if _sp_errs > 0:
+                    st.warning(f"{_sp_errs} post(s) failed to write.")
+                else:
+                    # Re-sort the full table by PublishTime descending
+                    with st.spinner("Re-sorting table by date..."):
+                        from dateutil import parser as _du_parser
+                        from datetime import timedelta as _timedelta
+
+                        _EXCEL_EPOCH = datetime(1899, 12, 30)
+
+                        def _sp_serial_to_str(val) -> str:
+                            return (_EXCEL_EPOCH + _timedelta(days=float(val))).strftime("%m/%d/%Y %H:%M")
+
+                        def _sp_normalize_pt(val) -> str:
+                            if isinstance(val, (int, float)):
+                                return _sp_serial_to_str(val)
+                            try:
+                                float(val)
+                                return _sp_serial_to_str(val)
+                            except (ValueError, TypeError):
+                                return str(val)
+
+                        def _sp_parse_dt(val):
+                            try:
+                                return _du_parser.parse(str(val))
+                            except Exception:
+                                return datetime.min
+
+                        _sp_all_rows = get_table_rows(_si_posts_fid, "SocialPosts", site_id=_si_sid)
+                        _sp_all_vals = [
+                            list((_r.get("values") or [[]])[0])
+                            for _r in _sp_all_rows
+                        ]
+                        # Convert any Excel date serial in PublishTime (index 4) to readable string
+                        for _rv in _sp_all_vals:
+                            if len(_rv) > 4:
+                                _rv[4] = _sp_normalize_pt(_rv[4])
+                        # Sort by PublishTime (column index 4) descending
+                        _sp_all_vals.sort(
+                            key=lambda _rv: _sp_parse_dt(_rv[4]) if len(_rv) > 4 else datetime.min,
+                            reverse=True,
+                        )
+                        # Delete all existing data rows (always delete index 0 as rows shift up)
+                        _sp_del_base = (
+                            f"{_table_base(_si_posts_fid, _si_sid)}/SocialPosts/rows/itemAt(index=0)"
+                        )
+                        for _ in range(len(_sp_all_vals)):
+                            requests.delete(_sp_del_base, headers=_headers(), timeout=20)
+                        # Re-append in sorted order with readable dates
+                        for _rv in _sp_all_vals:
+                            append_row(_si_posts_fid, "SocialPosts", _rv, site_id=_si_sid)
+
                     st.session_state["social_success"] = (
-                        f"Logged {len(_sp_new)} post(s) — {len(_sp_dupes)} duplicate(s) skipped."
+                        f"Logged {len(_sp_new)} post(s) — {len(_sp_dupes)} duplicate(s) skipped, "
+                        f"table re-sorted by date."
                     )
                     st.session_state.pop("si_posts_parsed",   None)
                     st.session_state.pop("si_posts_file_key", None)
                     st.rerun()
-                else:
-                    st.warning(f"{_sp_errs} post(s) failed to write.")
