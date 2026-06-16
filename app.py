@@ -676,6 +676,7 @@ _DEFAULTS = {
     "sales_pending_record": {},
     "sales_mtg_list": [],
     "active_tab": "",
+    "g_recipient_type": "",
     "gift_dupe_confirm": False,
     "gift_dupe_pending": {},
     "sales_dupe_confirm": False,
@@ -819,7 +820,7 @@ with gifting_tab:
         if st.session_state.get("gift_dupe_confirm"):
             _gd = st.session_state["gift_dupe_pending"]
             st.warning(
-                f"You gifted {_gd['recipient']} {_gd['match_bags']} bags on "
+                f"You gifted {_gd['recipient']} ({_gd.get('recipient_type', '')}) {_gd['match_bags']} bags on "
                 f"{_gd['match_date']}. Gift again?"
             )
             _gc1, _gc2 = st.columns(2)
@@ -841,12 +842,18 @@ with gifting_tab:
 
         # ── Gifting form ──────────────────────────────────────────────────────
         # GiftingLog columns:
-        # Timestamp | Recipient | Bags | Venue | Date | LoggedBy | Notes | Posted | PostLink | ContentType
+        # Timestamp | Recipient | RecipientType | Bags | Venue | Date | LoggedBy | Notes | Posted | PostLink | ContentType
         with st.form("gifting_form", clear_on_submit=True):
             recipient = st.text_input(
                 "Recipient *",
                 value=parsed.get("recipient", ""),
                 placeholder="Name, handle, or contact",
+            )
+            recipient_type = st.selectbox(
+                "Recipient Type *",
+                ["Creator", "Personal", "Lead"],
+                index=0,
+                key="g_recipient_type",
             )
             bags = st.number_input(
                 "Bags *",
@@ -904,6 +911,7 @@ with gifting_tab:
                 row = [
                     timestamp,
                     recipient.strip(),
+                    recipient_type,
                     int(bags),
                     venue.strip(),
                     gift_date.isoformat(),
@@ -920,9 +928,9 @@ with gifting_tab:
                 for _gr in _all_gifts:
                     _gv = (_gr.get("values") or [[]])[0]
                     if (
-                        len(_gv) > 4
+                        len(_gv) > 5
                         and str(_gv[1]).strip().lower() == recipient.strip().lower()
-                        and str(_gv[4]).strip() >= _thirty_ago
+                        and str(_gv[5]).strip() >= _thirty_ago
                     ):
                         _gift_match = _gv
                         break
@@ -931,8 +939,9 @@ with gifting_tab:
                     st.session_state["gift_dupe_pending"] = {
                         "row": row,
                         "recipient": recipient.strip(),
-                        "match_bags": _gift_match[2],
-                        "match_date": str(_gift_match[4]),
+                        "recipient_type": recipient_type,
+                        "match_bags": _gift_match[3],
+                        "match_date": str(_gift_match[5]),
                         "success_msg": (
                             f"Logged: {recipient.strip()} · {int(bags)} bags · "
                             f"{venue.strip()} · {gift_date.isoformat()}"
@@ -953,107 +962,103 @@ with gifting_tab:
     # ── MODE: Update Existing Record ──────────────────────────────────────────
     else:
 
-        # ── Search ────────────────────────────────────────────────────────────
-        g_search_q = st.text_input("Search recipient name", key="g_search_q")
-        if st.button("Search →", key="g_search_btn"):
-            if not g_search_q.strip():
-                st.warning("Enter a name to search.")
-            else:
-                with st.spinner("Searching SharePoint…"):
-                    _all_rows = get_table_rows(st.secrets["GIFTING_FILE_ID"], "GiftingLog")
-                _matches = [
-                    r for r in _all_rows
-                    if g_search_q.strip().lower() in str(r.get("values", [[]])[0][1] if r.get("values") else "").lower()
+        # GiftingLog column positions: 0=Timestamp 1=Recipient 2=RecipientType 3=Bags 4=Venue 5=Date
+        #                              6=LoggedBy 7=Notes 8=Posted 9=PostLink 10=ContentType
+        if st.session_state.get("g_search_results") is None:
+            with st.spinner("Loading records…"):
+                st.session_state["g_search_results"] = get_table_rows(
+                    st.secrets["GIFTING_FILE_ID"], "GiftingLog"
+                )
+
+        _results = st.session_state["g_search_results"]
+
+        if not _results:
+            st.info("No records found.")
+        else:
+            _opts = [
+                f"{r['values'][0][1]} · {r['values'][0][4]} · {r['values'][0][5]}"
+                for r in _results
+            ]
+            _sel_i = st.selectbox(
+                "Select record to edit",
+                range(len(_opts)),
+                format_func=lambda i: _opts[i],
+                key="g_sel_idx",
+            )
+            _row = _results[_sel_i]
+            _vals = _row["values"][0]
+            _row_index = _row["index"]
+
+            st.markdown("---")
+
+            # Read-only fields
+            st.text_input("Recipient", value=str(_vals[1]), disabled=True)
+            st.text_input("Venue", value=str(_vals[4]), disabled=True)
+            st.text_input("Content Type", value=str(_vals[10] or ""), disabled=True)
+
+            # Editable fields
+            _rt_options = ["Creator", "Personal", "Lead"]
+            _rt_idx = _rt_options.index(_vals[2]) if _vals[2] in _rt_options else 0
+            _edit_recipient_type = st.selectbox(
+                "Recipient Type", _rt_options, index=_rt_idx, key="g_edit_recipient_type",
+            )
+            _edit_bags = st.number_input(
+                "Bags", min_value=0, step=1,
+                value=max(0, int(_vals[3]) if str(_vals[3]).isdigit() else 0),
+                key="g_edit_bags",
+            )
+            _edit_date_default = date.today()
+            try:
+                _edit_date_default = dateparser.parse(str(_vals[5])).date()
+            except Exception:
+                pass
+            _edit_date = st.date_input("Date", value=_edit_date_default, key="g_edit_date")
+
+            _lb_options = ["Kolton", "Cameron"]
+            _lb_idx = 1 if str(_vals[6]) == "Cameron" else 0
+            _edit_logged_by = st.radio(
+                "Logged By", _lb_options, index=_lb_idx,
+                horizontal=True, key="g_edit_logged_by",
+            )
+            _edit_notes = st.text_area(
+                "Notes", value=str(_vals[7] or ""), height=80, key="g_edit_notes",
+            )
+            _edit_posted = st.checkbox(
+                "They posted", value=(str(_vals[8]).strip().lower() == "yes"),
+                key="g_edit_posted",
+            )
+            _edit_post_link = st.text_input(
+                "Post Link", value=str(_vals[9] or ""), key="g_edit_post_link",
+            )
+            _edit_used_link = _edit_post_link.strip() if _edit_posted else ""
+            _edit_content_type = detect_content_type(_edit_used_link) if _edit_used_link else str(_vals[10] or "")
+            st.caption(f"Content type: {_edit_content_type or '(none)'}")
+
+            if st.button("Update Record →", key="g_update_btn"):
+                _updated_row = [
+                    _vals[0],
+                    _vals[1],
+                    _edit_recipient_type,
+                    int(_edit_bags),
+                    _vals[4],
+                    _edit_date.isoformat(),
+                    _edit_logged_by,
+                    _edit_notes.strip(),
+                    "Yes" if _edit_posted else "No",
+                    _edit_used_link,
+                    _edit_content_type,
                 ]
-                st.session_state["g_search_results"] = _matches
-                st.rerun()
-
-        _results = st.session_state.get("g_search_results")
-
-        if _results is not None:
-            if not _results:
-                st.info("No matching records found.")
-            else:
-                # GiftingLog column positions: 0=Timestamp 1=Recipient 2=Bags 3=Venue 4=Date
-                #                              5=LoggedBy 6=Notes 7=Posted 8=PostLink 9=ContentType
-                _opts = [
-                    f"{r['values'][0][1]} · {r['values'][0][3]} · {r['values'][0][4]}"
-                    for r in _results
-                ]
-                _sel_i = st.selectbox(
-                    "Select record to edit",
-                    range(len(_opts)),
-                    format_func=lambda i: _opts[i],
-                    key="g_sel_idx",
-                )
-                _row = _results[_sel_i]
-                _vals = _row["values"][0]
-                _row_index = _row["index"]
-
-                st.markdown("---")
-
-                # Read-only fields
-                st.text_input("Recipient", value=str(_vals[1]), disabled=True)
-                st.text_input("Venue", value=str(_vals[3]), disabled=True)
-                st.text_input("Content Type", value=str(_vals[9] or ""), disabled=True)
-
-                # Editable fields
-                _edit_bags = st.number_input(
-                    "Bags", min_value=0, step=1,
-                    value=max(0, int(_vals[2]) if str(_vals[2]).isdigit() else 0),
-                    key="g_edit_bags",
-                )
-                _edit_date_default = date.today()
-                try:
-                    _edit_date_default = dateparser.parse(str(_vals[4])).date()
-                except Exception:
-                    pass
-                _edit_date = st.date_input("Date", value=_edit_date_default, key="g_edit_date")
-
-                _lb_options = ["Kolton", "Cameron"]
-                _lb_idx = 1 if str(_vals[5]) == "Cameron" else 0
-                _edit_logged_by = st.radio(
-                    "Logged By", _lb_options, index=_lb_idx,
-                    horizontal=True, key="g_edit_logged_by",
-                )
-                _edit_notes = st.text_area(
-                    "Notes", value=str(_vals[6] or ""), height=80, key="g_edit_notes",
-                )
-                _edit_posted = st.checkbox(
-                    "They posted", value=(str(_vals[7]).strip().lower() == "yes"),
-                    key="g_edit_posted",
-                )
-                _edit_post_link = st.text_input(
-                    "Post Link", value=str(_vals[8] or ""), key="g_edit_post_link",
-                )
-                _edit_used_link = _edit_post_link.strip() if _edit_posted else ""
-                _edit_content_type = detect_content_type(_edit_used_link) if _edit_used_link else str(_vals[9] or "")
-                st.caption(f"Content type: {_edit_content_type or '(none)'}")
-
-                if st.button("Update Record →", key="g_update_btn"):
-                    _updated_row = [
-                        _vals[0],
-                        _vals[1],
-                        int(_edit_bags),
-                        _vals[3],
-                        _edit_date.isoformat(),
-                        _edit_logged_by,
-                        _edit_notes.strip(),
-                        "Yes" if _edit_posted else "No",
-                        _edit_used_link,
-                        _edit_content_type,
-                    ]
-                    with st.spinner("Updating SharePoint…"):
-                        ok = patch_row(
-                            st.secrets["GIFTING_FILE_ID"], "GiftingLog",
-                            _row_index, _updated_row,
-                        )
-                    if ok:
-                        st.session_state["g_success"] = (
-                            f"Updated: {_vals[1]} · {int(_edit_bags)} bags · {_edit_date.isoformat()}"
-                        )
-                        st.session_state["g_search_results"] = None
-                        st.rerun()
+                with st.spinner("Updating SharePoint…"):
+                    ok = patch_row(
+                        st.secrets["GIFTING_FILE_ID"], "GiftingLog",
+                        _row_index, _updated_row,
+                    )
+                if ok:
+                    st.session_state["g_success"] = (
+                        f"Updated: {_vals[1]} · {int(_edit_bags)} bags · {_edit_date.isoformat()}"
+                    )
+                    st.session_state["g_search_results"] = None
+                    st.rerun()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
