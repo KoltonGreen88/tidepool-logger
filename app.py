@@ -677,6 +677,10 @@ _DEFAULTS = {
     "sales_mtg_list": [],
     "active_tab": "",
     "g_recipient_type": "",
+    "g_bags_bl": 0,
+    "g_bags_cl": 0,
+    "g_bags_pm": 0,
+    "e_post_gift_note": "",
     "gift_dupe_confirm": False,
     "gift_dupe_pending": {},
     "sales_dupe_confirm": False,
@@ -842,7 +846,7 @@ with gifting_tab:
 
         # ── Gifting form ──────────────────────────────────────────────────────
         # GiftingLog columns:
-        # Timestamp | Recipient | RecipientType | Bags | Venue | Date | LoggedBy | Notes | Posted | PostLink | ContentType
+        # Timestamp | Recipient | RecipientType | BagsBlueberryLemon | BagsCherryLime | BagsPeachMango | BagsTotal | Venue | Date | LoggedBy | Notes | Posted | PostLink | ContentType
         with st.form("gifting_form", clear_on_submit=True):
             recipient = st.text_input(
                 "Recipient *",
@@ -855,12 +859,13 @@ with gifting_tab:
                 index=0,
                 key="g_recipient_type",
             )
-            bags = st.number_input(
-                "Bags *",
-                min_value=0,
-                step=1,
-                value=max(0, int(parsed.get("bags") or 0)),
-            )
+            _fc1, _fc2, _fc3 = st.columns(3)
+            with _fc1:
+                bags_bl = st.number_input("Blueberry Lemon", min_value=0, step=1, value=0, key="g_bags_bl")
+            with _fc2:
+                bags_cl = st.number_input("Cherry Lime", min_value=0, step=1, value=0, key="g_bags_cl")
+            with _fc3:
+                bags_pm = st.number_input("Peach Mango", min_value=0, step=1, value=0, key="g_bags_pm")
             venue = st.text_input(
                 "Venue",
                 value=parsed.get("venue", ""),
@@ -898,13 +903,14 @@ with gifting_tab:
             errors = []
             if not recipient.strip():
                 errors.append("Recipient is required.")
-            if bags <= 0:
-                errors.append("Bags must be at least 1.")
+            if bags_bl + bags_cl + bags_pm == 0:
+                errors.append("Enter at least 1 bag across any flavor.")
 
             if errors:
                 for err in errors:
                     st.error(err)
             else:
+                bags_total = bags_bl + bags_cl + bags_pm
                 used_link = post_link.strip() if posted else ""
                 content_type = detect_content_type(used_link) if used_link else ""
                 timestamp = datetime.now().isoformat(timespec="seconds")
@@ -912,7 +918,10 @@ with gifting_tab:
                     timestamp,
                     recipient.strip(),
                     recipient_type,
-                    int(bags),
+                    int(bags_bl),
+                    int(bags_cl),
+                    int(bags_pm),
+                    bags_total,
                     venue.strip(),
                     gift_date.isoformat(),
                     logged_by,
@@ -928,9 +937,9 @@ with gifting_tab:
                 for _gr in _all_gifts:
                     _gv = (_gr.get("values") or [[]])[0]
                     if (
-                        len(_gv) > 5
+                        len(_gv) > 8
                         and str(_gv[1]).strip().lower() == recipient.strip().lower()
-                        and str(_gv[5]).strip() >= _thirty_ago
+                        and str(_gv[8]).strip() >= _thirty_ago
                     ):
                         _gift_match = _gv
                         break
@@ -940,10 +949,10 @@ with gifting_tab:
                         "row": row,
                         "recipient": recipient.strip(),
                         "recipient_type": recipient_type,
-                        "match_bags": _gift_match[3],
-                        "match_date": str(_gift_match[5]),
+                        "match_bags": _gift_match[6],
+                        "match_date": str(_gift_match[8]),
                         "success_msg": (
-                            f"Logged: {recipient.strip()} · {int(bags)} bags · "
+                            f"Logged: {recipient.strip()} · {bags_total} bags · "
                             f"{venue.strip()} · {gift_date.isoformat()}"
                         ),
                     }
@@ -953,7 +962,7 @@ with gifting_tab:
                         ok = append_row(st.secrets["GIFTING_FILE_ID"], "GiftingLog", row)
                     if ok:
                         st.session_state["g_success"] = (
-                            f"Logged: {recipient.strip()} · {int(bags)} bags · "
+                            f"Logged: {recipient.strip()} · {bags_total} bags · "
                             f"{venue.strip()} · {gift_date.isoformat()}"
                         )
                         st.session_state["g_parsed"] = {}
@@ -962,8 +971,9 @@ with gifting_tab:
     # ── MODE: Update Existing Record ──────────────────────────────────────────
     else:
 
-        # GiftingLog column positions: 0=Timestamp 1=Recipient 2=RecipientType 3=Bags 4=Venue 5=Date
-        #                              6=LoggedBy 7=Notes 8=Posted 9=PostLink 10=ContentType
+        # GiftingLog column positions: 0=Timestamp 1=Recipient 2=RecipientType
+        #   3=BagsBlueberryLemon 4=BagsCherryLime 5=BagsPeachMango 6=BagsTotal
+        #   7=Venue 8=Date 9=LoggedBy 10=Notes 11=Posted 12=PostLink 13=ContentType
         if st.session_state.get("g_search_results") is None:
             with st.spinner("Loading records…"):
                 st.session_state["g_search_results"] = get_table_rows(
@@ -972,11 +982,18 @@ with gifting_tab:
 
         _results = st.session_state["g_search_results"]
 
+        def _fmt_gift_date(val) -> str:
+            s = str(val).strip()
+            try:
+                return (datetime(1899, 12, 30) + timedelta(days=int(float(s)))).strftime("%Y-%m-%d")
+            except (ValueError, OverflowError):
+                return s
+
         if not _results:
             st.info("No records found.")
         else:
             _opts = [
-                f"{r['values'][0][1]} · {r['values'][0][4]} · {r['values'][0][5]}"
+                f"{r['values'][0][1]} · {r['values'][0][7]} · {_fmt_gift_date(r['values'][0][8])}"
                 for r in _results
             ]
             _sel_i = st.selectbox(
@@ -993,8 +1010,8 @@ with gifting_tab:
 
             # Read-only fields
             st.text_input("Recipient", value=str(_vals[1]), disabled=True)
-            st.text_input("Venue", value=str(_vals[4]), disabled=True)
-            st.text_input("Content Type", value=str(_vals[10] or ""), disabled=True)
+            st.text_input("Venue", value=str(_vals[7]), disabled=True)
+            st.text_input("Content Type", value=str(_vals[13] or ""), disabled=True)
 
             # Editable fields
             _rt_options = ["Creator", "Personal", "Lead"]
@@ -1002,36 +1019,52 @@ with gifting_tab:
             _edit_recipient_type = st.selectbox(
                 "Recipient Type", _rt_options, index=_rt_idx, key="g_edit_recipient_type",
             )
-            _edit_bags = st.number_input(
-                "Bags", min_value=0, step=1,
-                value=max(0, int(_vals[3]) if str(_vals[3]).isdigit() else 0),
-                key="g_edit_bags",
-            )
+            _efc1, _efc2, _efc3 = st.columns(3)
+            with _efc1:
+                _edit_bags_bl = st.number_input(
+                    "Blueberry Lemon", min_value=0, step=1,
+                    value=max(0, int(float(_vals[3])) if str(_vals[3]).replace(".", "", 1).isdigit() else 0),
+                    key="g_edit_bags_bl",
+                )
+            with _efc2:
+                _edit_bags_cl = st.number_input(
+                    "Cherry Lime", min_value=0, step=1,
+                    value=max(0, int(float(_vals[4])) if str(_vals[4]).replace(".", "", 1).isdigit() else 0),
+                    key="g_edit_bags_cl",
+                )
+            with _efc3:
+                _edit_bags_pm = st.number_input(
+                    "Peach Mango", min_value=0, step=1,
+                    value=max(0, int(float(_vals[5])) if str(_vals[5]).replace(".", "", 1).isdigit() else 0),
+                    key="g_edit_bags_pm",
+                )
+            _edit_bags_total = _edit_bags_bl + _edit_bags_cl + _edit_bags_pm
+            st.number_input("Bags Total (computed)", value=_edit_bags_total, disabled=True, key="g_edit_bags_total")
             _edit_date_default = date.today()
             try:
-                _edit_date_default = dateparser.parse(str(_vals[5])).date()
+                _edit_date_default = dateparser.parse(str(_vals[8])).date()
             except Exception:
                 pass
             _edit_date = st.date_input("Date", value=_edit_date_default, key="g_edit_date")
 
             _lb_options = ["Kolton", "Cameron"]
-            _lb_idx = 1 if str(_vals[6]) == "Cameron" else 0
+            _lb_idx = 1 if str(_vals[9]) == "Cameron" else 0
             _edit_logged_by = st.radio(
                 "Logged By", _lb_options, index=_lb_idx,
                 horizontal=True, key="g_edit_logged_by",
             )
             _edit_notes = st.text_area(
-                "Notes", value=str(_vals[7] or ""), height=80, key="g_edit_notes",
+                "Notes", value=str(_vals[10] or ""), height=80, key="g_edit_notes",
             )
             _edit_posted = st.checkbox(
-                "They posted", value=(str(_vals[8]).strip().lower() == "yes"),
+                "They posted", value=(str(_vals[11]).strip().lower() == "yes"),
                 key="g_edit_posted",
             )
             _edit_post_link = st.text_input(
-                "Post Link", value=str(_vals[9] or ""), key="g_edit_post_link",
+                "Post Link", value=str(_vals[12] or ""), key="g_edit_post_link",
             )
             _edit_used_link = _edit_post_link.strip() if _edit_posted else ""
-            _edit_content_type = detect_content_type(_edit_used_link) if _edit_used_link else str(_vals[10] or "")
+            _edit_content_type = detect_content_type(_edit_used_link) if _edit_used_link else str(_vals[13] or "")
             st.caption(f"Content type: {_edit_content_type or '(none)'}")
 
             if st.button("Update Record →", key="g_update_btn"):
@@ -1039,8 +1072,11 @@ with gifting_tab:
                     _vals[0],
                     _vals[1],
                     _edit_recipient_type,
-                    int(_edit_bags),
-                    _vals[4],
+                    int(_edit_bags_bl),
+                    int(_edit_bags_cl),
+                    int(_edit_bags_pm),
+                    _edit_bags_total,
+                    _vals[7],
                     _edit_date.isoformat(),
                     _edit_logged_by,
                     _edit_notes.strip(),
@@ -1055,7 +1091,7 @@ with gifting_tab:
                     )
                 if ok:
                     st.session_state["g_success"] = (
-                        f"Updated: {_vals[1]} · {int(_edit_bags)} bags · {_edit_date.isoformat()}"
+                        f"Updated: {_vals[1]} · {_edit_bags_total} bags · {_edit_date.isoformat()}"
                     )
                     st.session_state["g_search_results"] = None
                     st.rerun()
@@ -1072,6 +1108,9 @@ with event_tab:
     if st.session_state["e_post_success"]:
         st.success(st.session_state["e_post_success"])
         st.session_state["e_post_success"] = ""
+    if st.session_state.get("e_post_gift_note"):
+        st.info(st.session_state["e_post_gift_note"])
+        st.session_state["e_post_gift_note"] = ""
 
     st.markdown("### Event Tracking")
 
@@ -1250,6 +1289,24 @@ with event_tab:
                     with st.spinner("Updating SharePoint…"):
                         ok = patch_row(st.secrets["EVENTS_FILE_ID"], "EventLog", row_index, updated_row)
                     if ok:
+                        if int(sampled) > 0:
+                            _ev_gift_row = [
+                                datetime.now().isoformat(timespec="seconds"),
+                                row_vals[1],
+                                "Event",
+                                0, 0, 0,
+                                int(sampled),
+                                row_vals[1],
+                                row_vals[3],
+                                row_vals[5],
+                                "Auto-created from event wrap-up — update flavor breakdown if known",
+                                "No", "", "",
+                            ]
+                            append_row(st.secrets["GIFTING_FILE_ID"], "GiftingLog", _ev_gift_row)
+                            st.session_state["e_post_gift_note"] = (
+                                f"Gifting entry auto-created for {row_vals[1]} — "
+                                "update flavor breakdown in Gifting Log when known."
+                            )
                         st.session_state["e_post_success"] = (
                             f"Completed: {row_vals[1]} — {row_vals[3]}"
                         )
@@ -1309,6 +1366,24 @@ with event_tab:
                     with st.spinner("Saving to SharePoint…"):
                         ok = append_row(st.secrets["EVENTS_FILE_ID"], "EventLog", sp_row)
                     if ok:
+                        if int(sp_sampled) > 0:
+                            _sp_gift_row = [
+                                datetime.now().isoformat(timespec="seconds"),
+                                sp_venue.strip(),
+                                "Event",
+                                0, 0, 0,
+                                int(sp_sampled),
+                                sp_venue.strip(),
+                                sp_event_date.isoformat(),
+                                sp_logged_by,
+                                "Auto-created from event wrap-up — update flavor breakdown if known",
+                                "No", "", "",
+                            ]
+                            append_row(st.secrets["GIFTING_FILE_ID"], "GiftingLog", _sp_gift_row)
+                            st.session_state["e_post_gift_note"] = (
+                                f"Gifting entry auto-created for {sp_venue.strip()} — "
+                                "update flavor breakdown in Gifting Log when known."
+                            )
                         st.session_state["e_post_success"] = (
                             f"Logged: {sp_venue.strip()} — {sp_event_date.isoformat()}"
                         )
@@ -1502,6 +1577,23 @@ with creator_tab:
                             else:
                                 _logged_set.add(_dedup_key)
                                 _written += 1
+                                if _bulk_status == "selected":
+                                    _hist_gift_row = [
+                                        _ts,
+                                        _name,
+                                        "Creator",
+                                        0, 0, 0, 0,
+                                        "Roeme Application",
+                                        _ts[:10],
+                                        ca_logged_by,
+                                        f"Auto-created from {ca_campaign.strip()} creator selection — update flavor breakdown when gifted.",
+                                        "No",
+                                        "",
+                                        "",
+                                    ]
+                                    append_row(
+                                        st.secrets["GIFTING_FILE_ID"], "GiftingLog", _hist_gift_row
+                                    )
 
                     if _skipped:
                         st.warning(f"Skipped {len(_skipped)} duplicate(s) already logged this session: {', '.join(_skipped)}")
@@ -1717,11 +1809,12 @@ with creator_tab:
                                 _gifting_row = [
                                     _ts,
                                     _name,
-                                    "",
+                                    "Creator",
+                                    0, 0, 0, 0,
                                     "Roeme Application",
                                     _td,
                                     ca_logged_by,
-                                    f"Auto-created from {ca_campaign.strip()} creator selection",
+                                    f"Auto-created from {ca_campaign.strip()} creator selection — update flavor breakdown when gifted.",
                                     "No",
                                     "",
                                     "",
