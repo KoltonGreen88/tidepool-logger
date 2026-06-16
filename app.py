@@ -9,6 +9,12 @@ import requests
 import streamlit as st
 from dateutil import parser as dateparser
 
+# ── Claude model ────────────────────────────────────────────────────────────────
+# Single source of truth for every Claude API call in this app (structured forms
+# and the Quick Log universal intake box). Keep all calls on this one alias so
+# parsing behavior stays consistent.
+CLAUDE_MODEL = "claude-sonnet-4-6"
+
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="TIDEPOOL Logger",
@@ -315,7 +321,7 @@ def parse_with_ai(text: str) -> dict:
     client = anthropic.Anthropic(api_key=st.secrets["ANTHROPIC_API_KEY"])
     today = date.today().isoformat()
     msg = client.messages.create(
-        model="claude-sonnet-4-5",
+        model=CLAUDE_MODEL,
         max_tokens=512,
         messages=[
             {
@@ -502,7 +508,7 @@ def extract_meeting(content: str, data_source: str, meeting_type: str = "Externa
         return {}
     ac = anthropic.Anthropic(api_key=st.secrets["ANTHROPIC_API_KEY"])
     msg = ac.messages.create(
-        model="claude-sonnet-4-5",
+        model=CLAUDE_MODEL,
         max_tokens=2048,
         system=_sys,
         messages=[{"role": "user", "content": _usr}],
@@ -605,7 +611,7 @@ def extract_video(transcript: str, url: str, platform: str, saved_by: str) -> di
         return {}
     ac = anthropic.Anthropic(api_key=st.secrets["ANTHROPIC_API_KEY"])
     msg = ac.messages.create(
-        model="claude-sonnet-4-5",
+        model=CLAUDE_MODEL,
         max_tokens=1024,
         system=_sys,
         messages=[{"role": "user", "content": _usr}],
@@ -631,16 +637,734 @@ def _sales_fetch_meetings(file_id: str, site_id: str | None = None) -> list:
         return []
 
 
-def _get_pending_rows(file_id: str, table_name: str) -> list:
-    """Returns list of (row_index, values_list) for rows where status == 'pending'."""
+def _get_pending_rows(file_id: str, table_name: str, status_idx: int) -> list:
+    """Returns list of (row_index, values_list) for rows where status == 'pending'.
+
+    status_idx is the absolute column position of the status cell. Using an
+    absolute index (rather than a negative offset) keeps this correct after a
+    trailing ClientId column is appended to the table.
+    """
     rows = get_table_rows(file_id, table_name)
     out = []
     for r in rows:
         vals = r.get("values", [[]])[0] if r.get("values") else []
         idx = r.get("index", 0)
-        if vals and str(vals[-3]).lower() == "pending":
+        if vals and len(vals) > status_idx and str(vals[status_idx]).lower() == "pending":
             out.append((idx, vals))
     return out
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# UNIVERSAL INTAKE (Quick Log) helpers
+# Parses a single free-form voice/text input into multiple intents, validates,
+# previews, then routes each record through the EXISTING write functions above.
+# It never writes to SharePoint directly.
+# ══════════════════════════════════════════════════════════════════════════════
+
+INTAKE_SYSTEM_PROMPT = (
+    "You are the TIDEPOOL universal intake parser. Founders describe everything that "
+    "happened in plain language. Your job is to extract every distinct piece of loggable "
+    "data and route it to the correct destination.\n\n"
+    "TIDEPOOL context:\n"
+    "SKUs: Blueberry Lemon (BL), Cherry Lime (CL), Peach Mango (PM)\n"
+    "DTC price 24.99, B2B landed cost 11.31\n"
+    "Founders: Kolton and Cameron\n\n"
+    "Destinations and data types:\n\n"
+    "GIFTING - bags given to a specific named person (NOT bags sampled at an event)\n"
+    "Fields: recipient, recipient_type (Creator/Personal/Lead/Event), bags_bl, bags_cl, "
+    "bags_pm, bags_total, venue, date, notes\n"
+    "SKU mapping - map every spoken quantity to the matching flavor field:\n"
+    "  blueberry lemon / blueberry / blue / BL  -> bags_bl\n"
+    "  cherry lime / cherry / CL                -> bags_cl\n"
+    "  peach mango / peach / mango / PM         -> bags_pm\n"
+    "Examples: '1 bag of blueberry lemon' -> bags_bl=1; '2 cherry lime' -> bags_cl=2; "
+    "'3 BL and 2 CL' -> bags_bl=3, bags_cl=2. Any flavor not mentioned is 0. "
+    "Always set bags_total = bags_bl + bags_cl + bags_pm.\n"
+    "If one sentence gives bags to several different people, output a SEPARATE gifting "
+    "record per recipient containing only that person's bags. Never merge two recipients "
+    "into one record. Example: 'I gave Tiffany 1 BL and Marcie 2 CL' -> record 1 "
+    "{recipient: Tiffany, bags_bl: 1}, record 2 {recipient: Marcie, bags_cl: 2}.\n"
+    "recipient_type: infer it from context signals and report recipient_type_confidence "
+    "(high/medium/low):\n"
+    "  business signals (medspa, spa, studio, gym, clinic, 'owner of', 'her business', "
+    "'their front desk') -> Lead\n"
+    "  creator signals (followers, creator, influencer, posted, content, '@handle', "
+    "'her page') -> Creator\n"
+    "  personal signals ('my mom', 'my friend', 'my buddy', 'our friend', a bare first "
+    "name with no business or creator context) -> Personal\n"
+    "  mentioned as part of an event -> Event\n"
+    "Set recipient_type_confidence=high only when a signal is explicit and strong; medium "
+    "when inferred from a softer signal; low when there is NO signal at all (a bare name "
+    "with no context). When low, still put your best guess in recipient_type but mark it "
+    "low. venue is optional for a personal gift.\n\n"
+    "EVENT - a pop-up or sampling event where bags are SAMPLED (handed out broadly) or "
+    "SOLD, not given to one named person\n"
+    "Fields: venue_name, venue_type, event_date, bags_sampled, bags_sold, leads_captured, "
+    "follow_up_contacts, notes\n"
+    "Bags described as 'sampled', 'handed out', or 'gave out' at an event are EVENT data: "
+    "SUM them across flavors into bags_sampled (e.g. 'sampled 5 cherry lime and 5 "
+    "blueberry lemon' -> bags_sampled=10). Bags 'sold' go to bags_sold. Do NOT create a "
+    "gifting record and do NOT split sampled bags by flavor; sampled/sold event bags are "
+    "never gifting.\n"
+    "Infer venue_type from the name (spa/medspa -> Medspa; recovery/cryo/sauna -> Recovery "
+    "Studio; gym/fitness/performance/crossfit -> Performance Gym; club/wellness -> Wellness "
+    "Studio) and report venue_type_confidence (high/medium/low).\n\n"
+    "LEAD - a new sales prospect for the CRM\n"
+    "Fields: venue (the business / account name), contact_name (the person's name, null "
+    "if not stated), contact_role (e.g. owner, manager, front desk; null if not stated), "
+    "category, contact_info, notes, source\n"
+    "When the founder names a business but not the person, put the business in venue and "
+    "leave contact_name null. Capture any stated role in contact_role. Never put the "
+    "business name or a role word in contact_name.\n\n"
+    "VIDEO_IDEA - a TikTok/Instagram/YouTube URL\n"
+    "Fields: source_url, platform, saved_by\n\n"
+    "GRANOLA_PULL - request to pull latest meeting\n"
+    "Fields: meeting_reference\n\n"
+    "Rules:\n"
+    "- A single input can contain multiple intents\n"
+    "- Extract every distinct record\n"
+    "- 'gave / gifted / dropped off X to <person>' is GIFTING; 'sampled / handed out / "
+    "sold at <event>' is EVENT (bags_sampled / bags_sold). Never treat sampled event "
+    "bags as gifting, and never ask for gifting flavors when describing an event.\n"
+    "- One gifting sentence naming multiple recipients becomes multiple gifting records, "
+    "one per recipient\n"
+    "- If bags are gifted AND leads captured at an event, create the event record AND "
+    "separate lead records AND a gifting record\n"
+    "- Use today's date if not specified\n"
+    "- Numbers: words and loose phrasing resolve to integers when context is clear: "
+    "'two'/'tres'/'a pair'/'a couple' -> 2; 'a'/'one'/'a single' -> 1; 'about twenty'/"
+    "'like 20'/'twentyish' -> 20; 'a couple dozen' -> 24; 'half a dozen' -> 6. But truly "
+    "vague quantities ('a few', 'some', 'several') stay null so they can be confirmed.\n"
+    "- Resolve misspellings and likely speech-to-text errors to the intended SKU, name, or "
+    "venue when reasonably clear (e.g. 'cherry line' -> Cherry Lime)\n"
+    "- Return null for unclear fields, never guess blindly\n"
+    "- Never use em dashes\n"
+    "- Identify logged_by if stated, else null\n\n"
+    "Return JSON. Put recipient_type_confidence inside a gifting record's data and "
+    "venue_type_confidence inside an event record's data:\n"
+    '{ "intents": [ { "type": "...", "confidence": "high/medium/low", "data": {...}, '
+    '"needs_review": false } ], "ambiguities": [] }'
+)
+
+# Canonical SKU mapping. Never write a freeform SKU string.
+_SKU_CANON = {
+    "blueberry lemon": "Blueberry Lemon", "blueberry": "Blueberry Lemon",
+    "bl": "Blueberry Lemon", "blue": "Blueberry Lemon",
+    "cherry lime": "Cherry Lime", "cherry": "Cherry Lime",
+    "cl": "Cherry Lime", "cherry line": "Cherry Lime",
+    "peach mango": "Peach Mango", "peach": "Peach Mango",
+    "pm": "Peach Mango", "mango": "Peach Mango",
+}
+
+# Vague terms that must be treated as missing and clarified.
+_VAGUE_QTY = {"some", "a few", "a couple", "couple", "several", "a bunch",
+              "bunch", "handful", "a handful", "lots", "lots of", "many", "a lot"}
+_VAGUE_TEXT = {"a creator", "someone", "a place", "somewhere", "a venue",
+               "a person", "a lead", "a guy", "a girl", "a spot", "unknown", "n/a"}
+
+
+def normalize_sku(raw):
+    """Map any SKU reference to one of the three canonical values, else None."""
+    if raw is None:
+        return None
+    return _SKU_CANON.get(str(raw).strip().lower())
+
+
+def _is_vague_text(v) -> bool:
+    if v is None:
+        return True
+    s = str(v).strip().lower()
+    return s == "" or s in _VAGUE_TEXT
+
+
+def _coerce_qty(v):
+    """Return an int quantity, or None if vague/unparseable. 'about twenty' handled by parser."""
+    if v is None:
+        return None
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)):
+        return int(v)
+    s = str(v).strip().lower()
+    if s == "" or s in _VAGUE_QTY:
+        return None
+    # plain digits embedded in text e.g. "about 20"
+    import re as _re_q
+    m = _re_q.search(r"-?\d+", s.replace(",", ""))
+    return int(m.group()) if m else None
+
+
+def transcribe_whisper(audio_bytes: bytes, filename: str = "audio.wav") -> str:
+    """Send recorded audio to OpenAI Whisper (whisper-1) and return the transcript."""
+    key = st.secrets.get("OPENAI_API_KEY", "")
+    if not key or key == "paste-your-value-here":
+        st.error("OPENAI_API_KEY is not configured, so I cannot transcribe. Type your note instead.")
+        return ""
+    try:
+        resp = requests.post(
+            "https://api.openai.com/v1/audio/transcriptions",
+            headers={"Authorization": f"Bearer {key}"},
+            files={"file": (filename, audio_bytes, "audio/wav")},
+            data={"model": "whisper-1"},
+            timeout=120,
+        )
+        if resp.status_code != 200:
+            st.error(f"Whisper error {resp.status_code}: {resp.text[:200]}")
+            return ""
+        return (resp.json().get("text") or "").strip()
+    except Exception as exc:
+        st.error(f"Transcription failed: {exc}")
+        return ""
+
+
+def parse_intake(transcript: str) -> dict:
+    """Parse a free-form transcript into the multi-intent JSON object."""
+    if not check_rate_limit():
+        return {}
+    client = anthropic.Anthropic(api_key=st.secrets["ANTHROPIC_API_KEY"])
+    today = date.today().isoformat()
+    msg = client.messages.create(
+        model=CLAUDE_MODEL,
+        max_tokens=2048,
+        system=INTAKE_SYSTEM_PROMPT,
+        messages=[{
+            "role": "user",
+            "content": f"Today is {today}.\n\nFounder input:\n{transcript}",
+        }],
+    )
+    if not msg.content:
+        return {}
+    return json.loads(_strip_json(msg.content[0].text))
+
+
+def fuzzy_best(name: str, candidates: list):
+    """Return (best_candidate, ratio 0-1) for the closest fuzzy match."""
+    import difflib
+    if not name:
+        return (None, 0.0)
+    best, score = None, 0.0
+    for c in candidates:
+        if not c:
+            continue
+        r = difflib.SequenceMatcher(None, str(name).lower(), str(c).lower()).ratio()
+        if r > score:
+            best, score = str(c), r
+    return (best, score)
+
+
+def _test_record_flag() -> str:
+    """Current Test Mode flag value written to the TestRecord column."""
+    return "TRUE" if st.session_state.get("test_mode") else "FALSE"
+
+
+# Managed trailing columns, in physical append order, per table. ClientId is a
+# trailing idempotency key only on the four tables that lack a natural key
+# (SalesLeads keys on its col-0 uuid). TestRecord is appended to every table the
+# Logger writes to, except Finance/Social which are out of scope.
+def _managed_trailing_cols(table_name: str) -> list:
+    cols = []
+    if table_name in ("GiftingLog", "EventLog", "VideoIdeas", "MeetingLog"):
+        cols.append("ClientId")
+    if table_name in ("GiftingLog", "EventLog", "VideoIdeas", "MeetingLog",
+                      "SalesLeads", "CreatorApplications", "IntakeLog"):
+        cols.append("TestRecord")
+    return cols
+
+
+def _ensure_column(file_id: str, table_name: str, col_name: str,
+                   site_id: str | None = None) -> bool:
+    """Ensure the table has a trailing column named col_name. Cached per session.
+
+    Returns True only when the column is present (or was successfully added). On
+    any failure returns False so callers fall back gracefully rather than breaking
+    the existing structured forms. Existing rows get a blank cell (treated as
+    FALSE for TestRecord) on backfill.
+    """
+    if not file_id or file_id == "paste-your-value-here":
+        return False
+    cache = st.session_state.setdefault("_managed_cols", {})
+    ck = f"{site_id or ''}:{file_id}:{table_name}:{col_name}"
+    if ck in cache:
+        return cache[ck]
+    ok = False
+    try:
+        url = f"{_table_base(file_id, site_id)}/{table_name}/columns"
+        resp = requests.get(url, headers=_headers(), timeout=20)
+        if resp.status_code == 200:
+            names = [c.get("name", "") for c in resp.json().get("value", [])]
+            if col_name in names:
+                ok = True
+            else:
+                add = requests.post(url, headers=_headers(),
+                                    json={"name": col_name}, timeout=20)
+                ok = add.status_code in (200, 201)
+    except Exception:
+        ok = False
+    cache[ck] = ok
+    return ok
+
+
+def _present_trailing(file_id, table_name, site_id, cid, test_flag) -> list:
+    """Return [(col_name, value)] for each managed trailing column that exists,
+    in canonical order. Ensures (adds) the columns as needed."""
+    out = []
+    for col in _managed_trailing_cols(table_name):
+        if _ensure_column(file_id, table_name, col, site_id):
+            out.append((col, cid if col == "ClientId" else test_flag))
+    return out
+
+
+def append_cid(file_id, table_name, values, site_id=None, client_id=None,
+               idempotent=False) -> bool:
+    """Append a row through the existing append_row, carrying the managed trailing
+    columns (ClientId and/or TestRecord) when present. When idempotent=True, skips
+    the write (returns True) if a row with the same ClientId already exists."""
+    cid = client_id or str(uuid.uuid4())
+    present = _present_trailing(file_id, table_name, site_id, cid, _test_record_flag())
+    extra = [v for _, v in present]
+    cols = [c for c, _ in present]
+    if idempotent and "ClientId" in cols:
+        from_end = len(present) - cols.index("ClientId")
+        for r in get_table_rows(file_id, table_name, site_id):
+            v = (r.get("values") or [[]])[0]
+            if v and len(v) >= from_end and str(v[-from_end]).strip() == str(cid):
+                return True
+    return append_row(file_id, table_name, list(values) + extra, site_id)
+
+
+def append_with_test(file_id, table_name, values, site_id=None) -> bool:
+    """Append a row carrying only the TestRecord trailing column (for tables that
+    do not use a trailing ClientId, e.g. SalesLeads / Creator / Intake)."""
+    extra = []
+    if _ensure_column(file_id, table_name, "TestRecord", site_id):
+        extra.append(_test_record_flag())
+    return append_row(file_id, table_name, list(values) + extra, site_id)
+
+
+def patch_cid(file_id, table_name, row_index, values, existing_vals=None) -> bool:
+    """Patch a row, preserving its managed trailing columns (ClientId/TestRecord)
+    from the existing row when the columns exist (default site). A patch never
+    flips an existing record's TestRecord flag; genuinely new columns backfill to
+    a fresh ClientId or TestRecord = FALSE.
+    """
+    cols = [c for c in _managed_trailing_cols(table_name)
+            if _ensure_column(file_id, table_name, c)]
+    # Managed columns are appended in canonical order, so the trailing values the
+    # fetched row already carries are a prefix of cols.
+    existing_trailing = max(0, len(existing_vals) - len(values)) if existing_vals else 0
+    extra = []
+    for i, col in enumerate(cols):
+        cur = ""
+        if i < existing_trailing:
+            cur = str(existing_vals[-(existing_trailing - i)]).strip()
+        if not cur:
+            cur = str(uuid.uuid4()) if col == "ClientId" else "FALSE"
+        extra.append(cur)
+    return patch_row(file_id, table_name, row_index, list(values) + extra)
+
+
+def write_intake_audit(raw_transcript: str, parsed_intents: dict,
+                       resulting_record_ids: list, logged_by: str) -> None:
+    """Append one row to TIDEPOOL_Intake_Log. Silently skips if not configured."""
+    fid = st.secrets.get("INTAKE_LOG_FILE_ID", "")
+    if not fid or fid == "paste-your-value-here":
+        return
+    try:
+        append_with_test(fid, "IntakeLog", [
+            datetime.now().isoformat(timespec="seconds"),
+            (raw_transcript or "")[:30000],
+            json.dumps(parsed_intents)[:30000],
+            ", ".join(str(x) for x in resulting_record_ids),
+            logged_by or "",
+        ])
+    except Exception:
+        pass
+
+
+# ── Intake validation ──────────────────────────────────────────────────────────
+
+def validate_intent(intent: dict) -> list:
+    """Return a list of human-readable missing/vague required fields for one intent."""
+    t = (intent.get("type") or "").upper()
+    d = intent.get("data") or {}
+    missing = []
+
+    if t == "GIFTING":
+        if _is_vague_text(d.get("recipient")):
+            missing.append("recipient name")
+        bl = _coerce_qty(d.get("bags_bl")) or 0
+        cl = _coerce_qty(d.get("bags_cl")) or 0
+        pm = _coerce_qty(d.get("bags_pm")) or 0
+        if (bl + cl + pm) <= 0:
+            missing.append("at least one SKU quantity greater than 0")
+        # recipient_type defaults to Personal and venue is optional for a personal
+        # gift, so neither blocks. date defaults to today.
+
+    elif t == "EVENT":
+        if _is_vague_text(d.get("venue_name")):
+            missing.append("venue name")
+        if _coerce_qty(d.get("bags_sampled")) is None:
+            missing.append("bags sampled (a specific number)")
+        if _coerce_qty(d.get("bags_sold")) is None:
+            missing.append("bags sold (a specific number)")
+        # venue_type defaults to Other so it does not block.
+
+    elif t == "LEAD":
+        _account = d.get("venue") or d.get("company") or d.get("account") or d.get("name")
+        if _is_vague_text(_account):
+            missing.append("business / account name")
+        # Only the contact person's name is genuinely required when the business is
+        # already stated. The business name is not re-asked, and category falls back
+        # to a sane default / inference so it does not block.
+        if _is_vague_text(d.get("contact_name")):
+            missing.append("the contact person's name")
+
+    elif t == "VIDEO_IDEA":
+        url = str(d.get("source_url") or "").strip()
+        if not (url.startswith("http://") or url.startswith("https://")):
+            missing.append("a valid video URL")
+
+    elif t == "GRANOLA_PULL":
+        pass  # meeting_reference 'latest' is acceptable
+
+    return missing
+
+
+def intent_quantity_warnings(intent: dict) -> list:
+    """Non-blocking warnings: quantity reconciliation and date sanity."""
+    t = (intent.get("type") or "").upper()
+    d = intent.get("data") or {}
+    warnings = []
+    if t == "EVENT":
+        sampled = _coerce_qty(d.get("bags_sampled"))
+        sold = _coerce_qty(d.get("bags_sold"))
+        if sampled is not None and sold is not None and sold > sampled:
+            warnings.append(f"Sold ({sold}) is more than sampled ({sampled}). Please clarify.")
+    # Date sanity across types
+    _date_field = {"GIFTING": "date", "EVENT": "event_date"}.get(t)
+    if _date_field and d.get(_date_field):
+        try:
+            _dt = dateparser.parse(str(d[_date_field])).date()
+            _today = date.today()
+            if _dt > _today:
+                warnings.append(f"Date {_dt.isoformat()} is in the future. Confirm it is correct.")
+            elif (_today - _dt).days > 30:
+                warnings.append(f"Date {_dt.isoformat()} is more than 30 days ago. Confirm it is correct.")
+        except Exception:
+            pass
+    return warnings
+
+
+# ── Intake routing (builds canonical rows, reuses existing write functions) ─────
+
+_EVENT_VENUE_TYPES = ["Hotel/Luxury", "Wellness Studio", "Med Spa",
+                      "Recovery/Sports", "Corporate", "Other"]
+_LEAD_CATEGORIES = ["Recovery Studio", "Medspa", "Performance Gym",
+                    "Wellness Studio", "Corporate", "Hotel", "Event Space", "Other"]
+_LEAD_SOURCES = ["Referral", "Cold Outreach", "Event", "Walk-in", "Instagram", "Roeme", "Other"]
+
+
+def _resolve_date(v) -> str:
+    if not v:
+        return date.today().isoformat()
+    try:
+        return dateparser.parse(str(v)).date().isoformat()
+    except Exception:
+        return date.today().isoformat()
+
+
+def _closest_option(value, options, default):
+    if not value:
+        return default
+    best, score = fuzzy_best(value, options)
+    return best if (best and score >= 0.55) else default
+
+
+def build_gifting_row(d: dict, logged_by: str) -> list:
+    bl = _coerce_qty(d.get("bags_bl")) or 0
+    cl = _coerce_qty(d.get("bags_cl")) or 0
+    pm = _coerce_qty(d.get("bags_pm")) or 0
+    total = bl + cl + pm
+    rtype = d.get("recipient_type") or "Personal"
+    if rtype not in ("Creator", "Personal", "Lead", "Event"):
+        rtype = "Personal"
+    venue = str(d.get("venue") or d.get("context") or "").strip()
+    return [
+        datetime.now().isoformat(timespec="seconds"),
+        str(d.get("recipient") or "").strip(),
+        rtype,
+        bl, cl, pm, total,
+        venue,
+        _resolve_date(d.get("date")),
+        logged_by,
+        str(d.get("notes") or "").strip(),
+        "No", "", "",
+    ]
+
+
+def build_event_row(d: dict, logged_by: str) -> list:
+    sampled = _coerce_qty(d.get("bags_sampled")) or 0
+    sold = _coerce_qty(d.get("bags_sold")) or 0
+    leads = _coerce_qty(d.get("leads_captured")) or 0
+    followups = _coerce_qty(d.get("follow_up_contacts")) or 0
+    return [
+        datetime.now().isoformat(timespec="seconds"),
+        str(d.get("venue_name") or "").strip(),
+        _closest_option(d.get("venue_type"), _EVENT_VENUE_TYPES, "Other"),
+        _resolve_date(d.get("event_date")),
+        sampled + sold,          # BagsAllocated (best estimate from bags used)
+        logged_by,
+        sampled, sold, leads, followups,
+        str(d.get("notes") or "").strip(),
+        "Complete",
+    ]
+
+
+def build_lead_values(d: dict, logged_by: str, client_id: str) -> list:
+    venue = str(d.get("venue") or d.get("company") or d.get("account") or d.get("name") or "").strip()
+    contact_name = str(d.get("contact_name") or "").strip()
+    role = str(d.get("contact_role") or "").strip()
+    notes = str(d.get("notes") or "").strip()
+    if role:
+        notes = (f"Contact role: {role}. " + notes).strip()
+    contact_info = str(d.get("contact_info") or "").strip()
+    phone = email = instagram = ""
+    if "@" in contact_info and "." in contact_info and " " not in contact_info:
+        email = contact_info
+    elif contact_info.startswith("@") or "instagram.com" in contact_info.lower():
+        instagram = contact_info
+    elif any(ch.isdigit() for ch in contact_info):
+        phone = contact_info
+    now = datetime.now(timezone.utc).isoformat()
+    return [
+        client_id,
+        venue,
+        venue,
+        "Prospect",
+        logged_by,
+        _closest_option(d.get("category"), _LEAD_CATEGORIES, "Other"),
+        "Lead",
+        "Public",
+        _closest_option(d.get("source"), _LEAD_SOURCES, "Other"),
+        "",                       # address
+        phone,
+        "",                       # website
+        email,
+        instagram,
+        contact_name,
+        notes,
+        "",                       # additional info
+        "",                       # next action
+        (date.today() + timedelta(days=7)).isoformat(),
+        "",                       # (matches existing blank column)
+        "",                       # outreach draft
+        "Email",                  # outreach medium
+        now, now,
+        5,                        # fit score
+        "Unknown",                # franchise status
+    ]
+
+
+def build_video_row(d: dict, logged_by: str) -> tuple:
+    """Enrich a pasted URL through the existing MCP + extract_video pipeline.
+    Returns (row, ok). Falls back to a minimal row if transcription fails."""
+    url = str(d.get("source_url") or "").strip()
+    platform = str(d.get("platform") or detect_content_type(url) or "Other")
+    saved_by = str(d.get("saved_by") or logged_by)
+    ts = datetime.now().isoformat(timespec="seconds")
+    mcp = _transcribe_video_mcp(url)
+    ext = {}
+    if mcp and (mcp.get("transcript") or "").strip():
+        try:
+            ext = extract_video(mcp["transcript"], url, mcp.get("platform") or platform, saved_by)
+            for _k in ("creator_handle", "creator_name", "video_date", "platform"):
+                if mcp.get(_k):
+                    ext[_k] = mcp[_k]
+        except Exception:
+            ext = {}
+    if ext.get("platform"):
+        platform = ext["platform"]
+    row = [
+        url, platform,
+        str(ext.get("creator_handle") or ""),
+        str(ext.get("creator_name") or ""),
+        str(ext.get("video_date") or ""),
+        saved_by,
+        str(ext.get("key_idea") or ""),
+        str(ext.get("tidepool_relevance") or ""),
+        str(ext.get("relevance_reasoning") or ""),
+        str(ext.get("recommended_action") or ""),
+        str(ext.get("action_reasoning") or ""),
+        str(ext.get("content_hook") or ""),
+        str(ext.get("tactical_takeaway") or ""),
+        "confirmed",
+        ts,
+        saved_by,
+    ]
+    return row, bool(ext)
+
+
+def build_meeting_row(ext: dict) -> list:
+    fu = "; ".join(ext.get("follow_up_items") or [])
+    return [
+        ext.get("timestamp", datetime.now().isoformat(timespec="seconds")),
+        str(ext.get("meeting_type") or "External Meeting"),
+        str(ext.get("contact_name") or ""),
+        str(ext.get("contact_title") or ""),
+        str(ext.get("venue_name") or ""),
+        str(ext.get("venue_type") or ""),
+        str(ext.get("meeting_date") or ""),
+        str(ext.get("assigned_founder") or "Kolton"),
+        str(ext.get("opportunity_type") or ""),
+        ext.get("bags_gifted") or 0,
+        ext.get("bags_sold") or 0,
+        str(ext.get("revenue") or ""),
+        str(ext.get("stage") or ""),
+        str(ext.get("key_insight") or ""),
+        fu,
+        str(ext.get("wholesale_potential") or ""),
+        str(ext.get("franchise_flag", False)),
+        str(ext.get("notes") or ""),
+        str(ext.get("data_source") or ""),
+        str(ext.get("needs_review", False)),
+        str(ext.get("review_reason") or ""),
+        "confirmed",
+        str(ext.get("logged_by") or ext.get("assigned_founder") or "Kolton"),
+    ]
+
+
+def pull_granola_for_intent(meeting_reference: str) -> dict:
+    """Pull latest (or named) Granola meeting and run the existing extraction.
+    Returns the extraction dict (with needs_review/review_reason on failure)."""
+    meetings = _fetch_granola_meetings()
+    if not meetings:
+        return {"needs_review": True,
+                "review_reason": "No Granola meetings available or API not configured."}
+    chosen = meetings[0]
+    ref = (meeting_reference or "").strip().lower()
+    if ref and ref not in ("latest", "most recent", "last", "newest"):
+        best, score = fuzzy_best(ref, [m["title"] for m in meetings])
+        if best and score >= 0.4:
+            for m in meetings:
+                if m["title"] == best:
+                    chosen = m
+                    break
+    content = _fetch_granola_content(chosen["id"])
+    if not (content.get("content") or "").strip():
+        return {"needs_review": True, "venue_name": chosen.get("title"),
+                "review_reason": content.get("review_reason") or "No transcript or summary."}
+    try:
+        ext = extract_meeting(content["content"], content.get("data_source", "transcript"))
+    except Exception as exc:
+        return {"needs_review": True, "venue_name": chosen.get("title"),
+                "review_reason": f"Extraction failed: {exc}"}
+    ext["data_source"] = content.get("data_source", "transcript")
+    ext["needs_review"] = content.get("needs_review", False)
+    ext["review_reason"] = content.get("review_reason", "")
+    ext["_granola_title"] = chosen.get("title")
+    ext["timestamp"] = datetime.now().isoformat(timespec="seconds")
+    return ext
+
+
+def find_recent_gifting_dupe(recipient: str, date_iso: str, bl: int, cl: int, pm: int) -> dict:
+    """Return a near-duplicate gifting row logged within 6h (same recipient+date+bags)."""
+    try:
+        rows = get_table_rows(st.secrets["GIFTING_FILE_ID"], "GiftingLog")
+    except Exception:
+        return {}
+    for r in rows:
+        v = (r.get("values") or [[]])[0]
+        if len(v) < 9:
+            continue
+        if (str(v[1]).strip().lower() == recipient.strip().lower()
+                and str(v[8]).strip() == date_iso
+                and _coerce_qty(v[3]) == bl and _coerce_qty(v[4]) == cl
+                and _coerce_qty(v[5]) == pm and _within_6h(v[0])):
+            return {"timestamp": v[0], "bags": v[6]}
+    return {}
+
+
+def find_recent_event_dupe(venue: str, date_iso: str) -> dict:
+    """Return a near-duplicate event row logged within 6h (same venue+date)."""
+    try:
+        rows = get_table_rows(st.secrets["EVENTS_FILE_ID"], "EventLog")
+    except Exception:
+        return {}
+    for r in rows:
+        v = (r.get("values") or [[]])[0]
+        if len(v) < 4:
+            continue
+        if (str(v[1]).strip().lower() == venue.strip().lower()
+                and str(v[3]).strip() == date_iso and _within_6h(v[0])):
+            return {"timestamp": v[0]}
+    return {}
+
+
+def _within_6h(ts_str) -> bool:
+    try:
+        dt = dateparser.parse(str(ts_str))
+        if dt is None:
+            return False
+        if dt.tzinfo:
+            dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+        return (datetime.utcnow() - dt) <= timedelta(hours=6)
+    except Exception:
+        return False
+
+
+def route_intent(intent: dict, logged_by: str) -> tuple:
+    """Write one confirmed intent through the EXISTING write functions.
+    Returns (ok: bool, type_key: str, record_id: str)."""
+    t = (intent.get("type") or "").upper()
+    d = intent.get("data") or {}
+    cid = intent.get("_client_id") or str(uuid.uuid4())
+
+    if t == "GIFTING":
+        row = build_gifting_row(d, logged_by)
+        ok = append_cid(st.secrets["GIFTING_FILE_ID"], "GiftingLog", row,
+                        client_id=cid, idempotent=True)
+        return ok, "gifting", cid
+
+    if t == "EVENT":
+        row = build_event_row(d, logged_by)
+        ok = append_cid(st.secrets["EVENTS_FILE_ID"], "EventLog", row,
+                        client_id=cid, idempotent=True)
+        return ok, "event", cid
+
+    if t == "LEAD":
+        vals = build_lead_values(d, logged_by, cid)
+        # SalesLeads already keys on its uuid column (col 0); use append_row directly.
+        # Idempotency: skip if this client_id already present.
+        try:
+            for r in get_table_rows(st.secrets["SALES_FILE_ID"], "SalesLeads",
+                                    site_id=st.secrets["SALES_SITE_ID"]):
+                v = (r.get("values") or [[]])[0]
+                if v and str(v[0]).strip() == cid:
+                    return True, "lead", cid
+        except Exception:
+            pass
+        ok = append_with_test(st.secrets["SALES_FILE_ID"], "SalesLeads", vals,
+                              site_id=st.secrets["SALES_SITE_ID"])
+        return ok, "lead", cid
+
+    if t == "VIDEO_IDEA":
+        row, _enriched = build_video_row(d, logged_by)
+        ok = append_cid(st.secrets["VIDEO_FILE_ID"], "VideoIdeas", row,
+                        site_id=st.secrets["STRATEGY_SITE_ID"],
+                        client_id=cid, idempotent=True)
+        return ok, "video_idea", cid
+
+    if t == "GRANOLA_PULL":
+        ext = d.get("_meeting_ext") or {}
+        if not ext or not ext.get("venue_name"):
+            return False, "meeting_pulled", cid
+        row = build_meeting_row(ext)
+        ok = append_cid(st.secrets["MEETINGS_FILE_ID"], "MeetingLog", row,
+                        site_id=st.secrets["STRATEGY_SITE_ID"],
+                        client_id=cid, idempotent=True)
+        return ok, "meeting_pulled", cid
+
+    return False, t.lower() or "unknown", cid
 
 
 # ── Session state defaults ────────────────────────────────────────────────────
@@ -681,6 +1405,7 @@ _DEFAULTS = {
     "g_bags_cl": 0,
     "g_bags_pm": 0,
     "e_post_gift_note": "",
+    "e_post_error": "",
     "gift_dupe_confirm": False,
     "gift_dupe_pending": {},
     "sales_dupe_confirm": False,
@@ -697,6 +1422,19 @@ _DEFAULTS = {
     "social_dupe_confirm": False,
     "social_dupe_pending": {},
     "social_insights_dupe_confirm": False,
+    # ── Test Mode ──
+    "test_mode": False,
+    # ── Universal Intake (Quick Log) ──
+    "ql_transcript": "",
+    "ql_stage": "input",          # input → clarify → preview → done
+    "ql_intents": [],             # list of working intent dicts (with _client_id, _drop)
+    "ql_ambiguities": [],
+    "ql_raw_transcript": "",
+    "ql_logged_by": "Kolton",
+    "ql_result_msg": "",
+    "ql_gen": 0,                  # bumps to reset widget keys after a run
+    "ql_clarify_answer": "",
+    "ql_entities": None,          # cached known-entity universe (Layer 1/6)
 }
 for _k, _v in _DEFAULTS.items():
     if _k not in st.session_state:
@@ -775,6 +1513,659 @@ st.markdown(
 _ai_call_count = len(st.session_state.get("api_call_log", []))
 st.sidebar.caption(f"AI calls this session: {_ai_call_count}/50")
 
+# ══════════════════════════════════════════════════════════════════════════════
+# TEST MODE toggle (very top, above Quick Log). When ON, every record the Logger
+# writes (Quick Log AND all structured forms) is flagged TestRecord = TRUE.
+# ══════════════════════════════════════════════════════════════════════════════
+
+st.markdown(
+    """
+<style>
+/* Make the Test Mode toggle track orange when ON */
+div[data-testid="stToggle"] [data-baseweb="checkbox"] [aria-checked="true"] > div:first-child,
+div[data-testid="stToggle"] [role="switch"][aria-checked="true"] {
+    background-color: #E8862E !important;
+}
+</style>
+""",
+    unsafe_allow_html=True,
+)
+
+st.toggle("🧪 Test Mode", key="test_mode",
+          help="When on, records are written through the real save path but flagged "
+               "TestRecord = TRUE so dashboards can exclude them.")
+
+if st.session_state.get("test_mode"):
+    st.markdown(
+        """
+        <div style="background:#E8862E; color:#1C2B4A; border-radius:8px;
+                    padding:10px 14px; margin:4px 0 12px; font-weight:700;
+                    font-family:'Barlow Condensed',sans-serif; letter-spacing:1px;
+                    text-transform:uppercase; text-align:center;">
+            🧪 Test Mode Active: records will be flagged and excluded from dashboards
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+# ══════════════════════════════════════════════════════════════════════════════
+# QUICK LOG: universal voice/text intake box (sits above the structured forms)
+# ══════════════════════════════════════════════════════════════════════════════
+
+st.markdown(
+    """
+<style>
+/* Teal accent for the Quick Log mic recorder */
+[data-testid="stAudioInput"] button {
+    background-color: #2BB6A8 !important;
+    color: #ffffff !important;
+    border: none !important;
+}
+[data-testid="stAudioInput"] { border: 1px solid #2BB6A8 !important; border-radius: 8px; }
+</style>
+""",
+    unsafe_allow_html=True,
+)
+
+_QL_ICONS = {"GIFTING": "🎁", "EVENT": "📅", "LEAD": "🤝",
+             "VIDEO_IDEA": "🎬", "GRANOLA_PULL": "🧠"}
+_QL_ORDER = ["GIFTING", "EVENT", "LEAD", "VIDEO_IDEA", "GRANOLA_PULL"]
+_QL_COUNT_LABEL = {"gifting": "gifting", "event": "event", "lead": "leads",
+                   "video_idea": "video ideas", "meeting_pulled": "meeting pulled",
+                   "creator_added": "creator added"}
+
+
+def _ql_reset(keep_msg: bool = False):
+    st.session_state["ql_stage"] = "input"
+    st.session_state["ql_intents"] = []
+    st.session_state["ql_ambiguities"] = []
+    st.session_state["ql_transcript"] = ""
+    st.session_state["ql_raw_transcript"] = ""
+    if not keep_msg:
+        st.session_state["ql_result_msg"] = ""
+    st.session_state["ql_gen"] += 1
+
+
+_QL_RT_OPTS = ["Creator", "Personal", "Lead", "Event"]
+
+
+def _ql_norm(s) -> str:
+    return str(s or "").strip().lower()
+
+
+def _ql_load_entities() -> dict:
+    """Read the known TIDEPOOL universe once per session (Layer 1 + Layer 6).
+    Cached in session_state['ql_entities']. Test records are excluded."""
+    cached = st.session_state.get("ql_entities")
+    if cached is not None:
+        return cached
+
+    recipients, venues, creators, leads, memory = {}, {}, {}, {}, {}
+
+    def _not_test(vals, base_len):
+        return not any(str(v).strip().upper() == "TRUE" for v in vals[base_len:])
+
+    # GiftingLog: Recipient(1), RecipientType(2), Venue(7); 14 base columns
+    try:
+        for r in get_table_rows(st.secrets["GIFTING_FILE_ID"], "GiftingLog"):
+            v = (r.get("values") or [[]])[0]
+            if len(v) < 8 or not _not_test(v, 14):
+                continue
+            name, rtype, ven = str(v[1]).strip(), str(v[2]).strip(), str(v[7]).strip()
+            if name:
+                recipients[_ql_norm(name)] = {"name": name, "type": rtype or None}
+                if rtype.lower() == "creator":
+                    creators[_ql_norm(name)] = name
+            if ven:
+                venues[_ql_norm(ven)] = ven
+    except Exception:
+        pass
+
+    # SalesLeads: venue_name(1), contact_name(14); 26 base columns
+    try:
+        for r in get_table_rows(st.secrets["SALES_FILE_ID"], "SalesLeads",
+                                site_id=st.secrets["SALES_SITE_ID"]):
+            v = (r.get("values") or [[]])[0]
+            if len(v) < 2 or not _not_test(v, 26):
+                continue
+            ven = str(v[1]).strip()
+            if ven:
+                venues[_ql_norm(ven)] = ven
+                leads[_ql_norm(ven)] = {"venue": ven}
+            if len(v) > 14 and str(v[14]).strip():
+                leads[_ql_norm(v[14])] = {"venue": ven}
+    except Exception:
+        pass
+
+    # CreatorApplications: Name(3); 13 base columns
+    try:
+        for r in get_table_rows(st.secrets["CREATOR_FILE_ID"], "CreatorApplications"):
+            v = (r.get("values") or [[]])[0]
+            if len(v) < 4 or not _not_test(v, 13):
+                continue
+            nm = str(v[3]).strip()
+            if nm:
+                creators[_ql_norm(nm)] = nm
+    except Exception:
+        pass
+
+    # EventLog: Venue(1); 12 base columns
+    try:
+        for r in get_table_rows(st.secrets["EVENTS_FILE_ID"], "EventLog"):
+            v = (r.get("values") or [[]])[0]
+            if len(v) < 2 or not _not_test(v, 12):
+                continue
+            ven = str(v[1]).strip()
+            if ven:
+                venues[_ql_norm(ven)] = ven
+    except Exception:
+        pass
+
+    # Entity memory (Layer 6): entity_name(0), resolved_type(1), canonical_venue(2)
+    mfid = st.secrets.get("ENTITY_MEMORY_FILE_ID", "")
+    if mfid and mfid != "paste-your-value-here":
+        try:
+            for r in get_table_rows(mfid, "EntityMemory"):
+                v = (r.get("values") or [[]])[0]
+                if not v or not str(v[0]).strip():
+                    continue
+                memory[_ql_norm(v[0])] = {
+                    "resolved_type": str(v[1]).strip() if len(v) > 1 else "",
+                    "canonical_venue": str(v[2]).strip() if len(v) > 2 else "",
+                }
+        except Exception:
+            pass
+
+    ents = {"recipients": recipients, "venues": venues, "creators": creators,
+            "leads": leads, "memory": memory}
+    st.session_state["ql_entities"] = ents
+    return ents
+
+
+def _ql_resolve_recipient(name, ents):
+    """Return (canonical_name, resolved_type|None, source). Memory wins, then exact,
+    then fuzzy >0.85. source in memory/recipient/creator/lead/none."""
+    n = _ql_norm(name)
+    if not n:
+        return (name, None, "none")
+    mem = ents["memory"].get(n)
+    if mem and mem.get("resolved_type"):
+        return (name, mem["resolved_type"], "memory")
+    if n in ents["recipients"] and ents["recipients"][n].get("type"):
+        r = ents["recipients"][n]
+        return (r["name"], r["type"], "recipient")
+    if n in ents["creators"]:
+        return (ents["creators"][n], "Creator", "creator")
+    if n in ents["leads"]:
+        return (name, "Lead", "lead")
+    cand = {}
+    for r in ents["recipients"].values():
+        cand[r["name"]] = r.get("type")
+    for nm in ents["creators"].values():
+        cand.setdefault(nm, "Creator")
+    best, score = fuzzy_best(name, list(cand.keys()))
+    if best and score >= 0.85:
+        mm = ents["memory"].get(_ql_norm(best))
+        if mm and mm.get("resolved_type"):
+            return (best, mm["resolved_type"], "memory")
+        bt = cand.get(best)
+        return (best, bt, "recipient" if bt else "none")
+    return (name, None, "none")
+
+
+def _ql_resolve_venue(name, ents):
+    """Return canonical venue spelling if matched >0.85, else the original name."""
+    n = _ql_norm(name)
+    if not n:
+        return name
+    if n in ents["venues"]:
+        return ents["venues"][n]
+    best, score = fuzzy_best(name, list(ents["venues"].values()))
+    return best if (best and score >= 0.85) else name
+
+
+def _ql_write_entity_memory(entity_name, resolved_type, canonical_venue, by):
+    """Upsert a correction into TIDEPOOL_Entity_Memory (Layer 6). No-op if not set."""
+    fid = st.secrets.get("ENTITY_MEMORY_FILE_ID", "")
+    if not fid or fid == "paste-your-value-here" or not str(entity_name).strip():
+        return
+    now = datetime.now().isoformat(timespec="seconds")
+    row = [str(entity_name).strip(), resolved_type or "", canonical_venue or "", now, by or ""]
+    try:
+        for r in get_table_rows(fid, "EntityMemory"):
+            v = (r.get("values") or [[]])[0]
+            if v and _ql_norm(v[0]) == _ql_norm(entity_name):
+                patch_row(fid, "EntityMemory", r.get("index", 0), row)
+                break
+        else:
+            append_row(fid, "EntityMemory", row)
+    except Exception:
+        pass
+    st.session_state["ql_entities"] = None  # refresh cache so the learning takes effect
+
+
+def _ql_resolve_entities(intents):
+    """Layer 1 + Layer 2: resolve against the known universe, else fall back to the
+    parser's inference, and stamp per-field confidence + spawn eligibility."""
+    ents = _ql_load_entities()
+    for it in intents:
+        t = (it.get("type") or "").upper()
+        d = it.setdefault("data", {})
+        conf = it.setdefault("_conf", {})
+        if t == "GIFTING":
+            canon, rtype, source = _ql_resolve_recipient(d.get("recipient"), ents)
+            if d.get("recipient"):
+                d["recipient"] = canon
+            if rtype:
+                # resolved against the known universe or memory -> HIGH, no flag
+                d["recipient_type"] = rtype
+                conf["recipient_type"] = "high"
+                it["_resolved_recipient"] = source
+            else:
+                # new entity: trust the parser's inference only at medium (flag for a
+                # one-tap fix); with no signal at all, require a pick on confirm
+                pconf = _ql_norm(d.get("recipient_type_confidence"))
+                guess = d.get("recipient_type")
+                conf["recipient_type"] = "medium" if (guess in _QL_RT_OPTS and pconf in ("high", "medium")) else "low"
+                it["_resolved_recipient"] = "new"
+            it["_assumed_type"] = d.get("recipient_type")
+        elif t == "EVENT":
+            if d.get("venue_name"):
+                d["venue_name"] = _ql_resolve_venue(d.get("venue_name"), ents)
+            conf["venue_type"] = "high" if _ql_norm(d.get("venue_type_confidence")) == "high" else "medium"
+        elif t == "LEAD":
+            acct = d.get("venue") or d.get("company") or d.get("account") or d.get("name")
+            if acct:
+                d["venue"] = _ql_resolve_venue(acct, ents)
+            conf["category"] = "medium"
+
+
+def _ql_enrich_granola(intents):
+    for it in intents:
+        if (it.get("type") or "").upper() == "GRANOLA_PULL" and not it.get("_drop"):
+            d = it.setdefault("data", {})
+            if "_meeting_ext" not in d:
+                with st.spinner("Pulling Granola meeting..."):
+                    d["_meeting_ext"] = pull_granola_for_intent(d.get("meeting_reference") or "latest")
+                if d["_meeting_ext"].get("needs_review"):
+                    it["needs_review"] = True
+
+
+def _ql_prepare(parsed: dict, raw: str):
+    intents = parsed.get("intents") or []
+    for it in intents:
+        it["_client_id"] = str(uuid.uuid4())
+        it["_drop"] = False
+        it["_dupe_action"] = "ask"
+        it["_spawn_do"] = False
+    _ql_resolve_entities(intents)
+    _ql_enrich_granola(intents)
+    st.session_state["ql_intents"] = intents
+    st.session_state["ql_ambiguities"] = parsed.get("ambiguities") or []
+    st.session_state["ql_raw_transcript"] = raw
+    for it in intents:
+        _lb = (it.get("data") or {}).get("logged_by") or (it.get("data") or {}).get("saved_by")
+        if _lb in ("Kolton", "Cameron"):
+            st.session_state["ql_logged_by"] = _lb
+            break
+    needs = any(validate_intent(it) for it in intents if not it.get("_drop"))
+    st.session_state["ql_stage"] = "clarify" if needs else "preview"
+
+
+def _ql_spawn_lead(d: dict, lb: str) -> bool:
+    """Layer 5: create a SalesLeads record from a new gifting recipient."""
+    recip = str(d.get("recipient") or "").strip()
+    lead_data = {
+        "venue": d.get("venue") or recip,
+        "contact_name": recip,
+        "category": "Other",
+        "notes": "Added from Quick Log gifting",
+        "source": "Gifting",
+    }
+    vals = build_lead_values(lead_data, lb, str(uuid.uuid4()))
+    return append_with_test(st.secrets["SALES_FILE_ID"], "SalesLeads", vals,
+                            site_id=st.secrets["SALES_SITE_ID"])
+
+
+def _ql_spawn_creator(d: dict, lb: str) -> bool:
+    """Layer 5: add a CreatorApplications record from a new gifting recipient."""
+    recip = str(d.get("recipient") or "").strip()
+    row = [
+        datetime.now().isoformat(timespec="seconds"),
+        "Quick Log", "", recip, None, None,
+        "Added via Quick Log gifting", "pending", 0, "", "", "", lb,
+    ]
+    return append_with_test(st.secrets["CREATOR_FILE_ID"], "CreatorApplications", row)
+
+
+def _ql_confirm_all():
+    intents = st.session_state["ql_intents"]
+    lb = st.session_state["ql_logged_by"]
+    counts, fails, ids = {}, [], []
+    with st.spinner("Routing to SharePoint..."):
+        for it in intents:
+            if it.get("_drop") or it.get("_dupe_action") == "skip":
+                continue
+            try:
+                ok, key, rid = route_intent(it, lb)
+            except Exception:
+                ok, key, rid = False, (it.get("type") or "unknown").lower(), ""
+            if not ok:
+                fails.append(it.get("type") or key)
+                continue
+            counts[key] = counts.get(key, 0) + 1
+            ids.append(rid)
+            if (it.get("type") or "").upper() == "GIFTING":
+                d = it.get("data") or {}
+                # Layer 6: persist a recipient_type correction so it is learned.
+                _final = d.get("recipient_type")
+                if (d.get("recipient") and _final in _QL_RT_OPTS
+                        and _final != it.get("_assumed_type")):
+                    _ql_write_entity_memory(d["recipient"], _final, "", lb)
+                # Layer 5: spawn the related record if the founder accepted the offer.
+                if it.get("_spawn_do"):
+                    try:
+                        if it.get("_spawn") == "lead" and _ql_spawn_lead(d, lb):
+                            counts["lead"] = counts.get("lead", 0) + 1
+                        elif it.get("_spawn") == "creator" and _ql_spawn_creator(d, lb):
+                            counts["creator_added"] = counts.get("creator_added", 0) + 1
+                    except Exception:
+                        pass
+        st.session_state["ql_entities"] = None  # refresh known universe after writes
+        _audit_payload = {"intents": [
+            {k: v for k, v in it.items() if not k.startswith("_") or k == "_client_id"}
+            for it in intents], "ambiguities": st.session_state.get("ql_ambiguities", [])}
+        write_intake_audit(st.session_state["ql_raw_transcript"], _audit_payload, ids, lb)
+    parts = [f"{n} {_QL_COUNT_LABEL.get(k, k)}" for k, n in counts.items()]
+    msg = ("Logged: " + ", ".join(parts)) if parts else "Nothing was logged."
+    if fails:
+        msg += f"  |  Failed (not lost): {', '.join(fails)}"
+    st.session_state["ql_result_msg"] = msg
+    _ql_reset(keep_msg=True)
+
+
+def _ql_render_card(i: int, it: dict, qg: int):
+    t = (it.get("type") or "").upper()
+    d = it.setdefault("data", {})
+    _flags = []
+    if str(it.get("confidence", "")).lower() == "low":
+        _flags.append("low confidence")
+    if it.get("needs_review"):
+        _flags.append("needs review")
+    _border = "#D8862E" if _flags else "#3a4f70"
+
+    with st.container(border=True):
+        if _flags:
+            st.markdown(
+                f"<span style='color:#D8862E;font-weight:700;'>🟠 {' · '.join(_flags)}</span>",
+                unsafe_allow_html=True,
+            )
+        _conf = it.get("_conf", {})
+
+        if t == "GIFTING":
+            d["recipient"] = st.text_input("Recipient", value=str(d.get("recipient") or ""), key=f"qe_grec_{i}_{qg}")
+            _rt_conf = _conf.get("recipient_type", "high")
+            if _rt_conf == "low":
+                _opts = ["Select type…"] + _QL_RT_OPTS
+                _cur = d.get("recipient_type") if d.get("recipient_type") in _QL_RT_OPTS else "Select type…"
+                _sel = st.selectbox("Recipient Type  🟠 pick one", _opts,
+                                    index=_opts.index(_cur), key=f"qe_grt_{i}_{qg}")
+                d["recipient_type"] = "" if _sel == "Select type…" else _sel
+            else:
+                _cur = d.get("recipient_type") if d.get("recipient_type") in _QL_RT_OPTS else "Personal"
+                _label = ("Recipient Type  🟠 (assumed - tap to change)"
+                          if _rt_conf == "medium" else "Recipient Type")
+                d["recipient_type"] = st.selectbox(_label, _QL_RT_OPTS,
+                                                   index=_QL_RT_OPTS.index(_cur), key=f"qe_grt_{i}_{qg}")
+                if _rt_conf == "high" and it.get("_resolved_recipient") not in (None, "new"):
+                    st.caption(f"✓ Known {d['recipient_type']}")
+            _b1, _b2, _b3 = st.columns(3)
+            with _b1:
+                d["bags_bl"] = st.number_input("Blueberry Lemon", min_value=0, step=1, value=_coerce_qty(d.get("bags_bl")) or 0, key=f"qe_gbl_{i}_{qg}")
+            with _b2:
+                d["bags_cl"] = st.number_input("Cherry Lime", min_value=0, step=1, value=_coerce_qty(d.get("bags_cl")) or 0, key=f"qe_gcl_{i}_{qg}")
+            with _b3:
+                d["bags_pm"] = st.number_input("Peach Mango", min_value=0, step=1, value=_coerce_qty(d.get("bags_pm")) or 0, key=f"qe_gpm_{i}_{qg}")
+            d["venue"] = st.text_input("Venue / context", value=str(d.get("venue") or d.get("context") or ""), key=f"qe_gven_{i}_{qg}")
+            # Layer 5: offer to spawn a related record for a brand-new recipient.
+            if it.get("_resolved_recipient") == "new" and d.get("recipient_type") in ("Lead", "Creator"):
+                _nm = str(d.get("recipient") or "").strip() or "this person"
+                if d["recipient_type"] == "Lead":
+                    it["_spawn"] = "lead"
+                    it["_spawn_do"] = st.checkbox(
+                        f"{_nm} is new. Add to the Sales CRM as a lead too?",
+                        value=bool(it.get("_spawn_do")), key=f"qe_spawn_{i}_{qg}")
+                else:
+                    it["_spawn"] = "creator"
+                    it["_spawn_do"] = st.checkbox(
+                        f"{_nm} is new. Add to the creator roster too?",
+                        value=bool(it.get("_spawn_do")), key=f"qe_spawn_{i}_{qg}")
+            else:
+                it["_spawn"], it["_spawn_do"] = None, False
+
+        elif t == "EVENT":
+            d["venue_name"] = st.text_input("Venue", value=str(d.get("venue_name") or ""), key=f"qe_even_{i}_{qg}")
+            _vt_default = _closest_option(d.get("venue_type"), _EVENT_VENUE_TYPES, "Other")
+            _vt_label = ("Venue Type  🟠 (assumed - tap to change)"
+                         if _conf.get("venue_type") == "medium" else "Venue Type")
+            d["venue_type"] = st.selectbox(_vt_label, _EVENT_VENUE_TYPES,
+                                           index=_EVENT_VENUE_TYPES.index(_vt_default), key=f"qe_evt_{i}_{qg}")
+            _e1, _e2 = st.columns(2)
+            with _e1:
+                d["bags_sampled"] = st.number_input("Sampled", min_value=0, step=1, value=_coerce_qty(d.get("bags_sampled")) or 0, key=f"qe_esm_{i}_{qg}")
+            with _e2:
+                d["bags_sold"] = st.number_input("Sold", min_value=0, step=1, value=_coerce_qty(d.get("bags_sold")) or 0, key=f"qe_esl_{i}_{qg}")
+
+        elif t == "LEAD":
+            d["venue"] = st.text_input("Business / account", value=str(d.get("venue") or d.get("company") or d.get("account") or d.get("name") or ""), key=f"qe_lven_{i}_{qg}")
+            d["contact_name"] = st.text_input("Contact name", value=str(d.get("contact_name") or ""), placeholder="Person on the card", key=f"qe_lnm_{i}_{qg}")
+            d["contact_role"] = st.text_input("Contact role", value=str(d.get("contact_role") or ""), placeholder="owner, manager, front desk", key=f"qe_lrole_{i}_{qg}")
+            _cat_label = ("Category  🟠 (assumed - tap to change)"
+                          if _conf.get("category") == "medium" else "Category")
+            d["category"] = st.selectbox(_cat_label, _LEAD_CATEGORIES, index=_LEAD_CATEGORIES.index(_closest_option(d.get("category"), _LEAD_CATEGORIES, "Other")), key=f"qe_lcat_{i}_{qg}")
+            d["contact_info"] = st.text_input("Contact info", value=str(d.get("contact_info") or ""), key=f"qe_lci_{i}_{qg}")
+
+        elif t == "VIDEO_IDEA":
+            d["source_url"] = st.text_input("Video URL", value=str(d.get("source_url") or ""), key=f"qe_vurl_{i}_{qg}")
+            st.caption(f"Platform: {detect_content_type(str(d.get('source_url') or '')) or '(detect on save)'} · full details extracted on confirm")
+
+        elif t == "GRANOLA_PULL":
+            _ext = d.get("_meeting_ext") or {}
+            if _ext.get("venue_name"):
+                st.markdown(f"**{_ext.get('venue_name')}** · {_ext.get('contact_name') or '-'} · {_ext.get('meeting_date') or '-'}")
+                st.caption(str(_ext.get("key_insight") or ""))
+            else:
+                st.caption(f"Granola: {_ext.get('review_reason') or 'pulling latest meeting'}")
+
+        # Quantity reconciliation + date sanity
+        for _w in intent_quantity_warnings(it):
+            st.warning(_w)
+
+        # Duplicate detection within 6h
+        _dupe = {}
+        if t == "GIFTING":
+            _bl = _coerce_qty(d.get("bags_bl")) or 0
+            _cl = _coerce_qty(d.get("bags_cl")) or 0
+            _pm = _coerce_qty(d.get("bags_pm")) or 0
+            if d.get("recipient"):
+                _dupe = find_recent_gifting_dupe(str(d.get("recipient")), _resolve_date(d.get("date")), _bl, _cl, _pm)
+        elif t == "EVENT" and d.get("venue_name"):
+            _dupe = find_recent_event_dupe(str(d.get("venue_name")), _resolve_date(d.get("event_date")))
+        if _dupe and it.get("_dupe_action") == "ask":
+            try:
+                _mins = int((datetime.utcnow() - dateparser.parse(str(_dupe["timestamp"])).replace(tzinfo=None)).total_seconds() // 60)
+            except Exception:
+                _mins = 0
+            st.warning(f"Similar record logged {_mins} minutes ago. Log anyway or skip?")
+            _dc1, _dc2 = st.columns(2)
+            with _dc1:
+                if st.button("Log anyway", key=f"qe_dup_yes_{i}_{qg}"):
+                    it["_dupe_action"] = "anyway"
+                    st.rerun()
+            with _dc2:
+                if st.button("Skip this one", key=f"qe_dup_skip_{i}_{qg}"):
+                    it["_dupe_action"] = "skip"
+                    st.rerun()
+        elif it.get("_dupe_action") == "skip":
+            st.caption("Will be skipped.")
+
+        if st.button("Remove this record", key=f"qe_rm_{i}_{qg}"):
+            it["_drop"] = True
+            st.rerun()
+
+
+# ── Quick Log render ────────────────────────────────────────────────────────
+_qg = st.session_state["ql_gen"]
+
+st.markdown(
+    """
+    <div style="background:#243350; border:1px solid #2BB6A8; border-radius:12px;
+                padding:16px 18px; margin-bottom:14px;">
+        <div style="font-family:'Barlow Condensed',sans-serif; font-size:26px;
+                    font-weight:700; color:#2BB6A8; text-transform:uppercase;
+                    letter-spacing:2px;">Quick Log</div>
+        <div style="font-family:'Barlow',sans-serif; font-size:14px; color:#8090b0;">
+            Tell me what happened, I'll sort it out.
+        </div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
+if st.session_state["ql_result_msg"] and st.session_state["ql_stage"] == "input":
+    st.success(st.session_state["ql_result_msg"])
+    st.session_state["ql_result_msg"] = ""
+
+# ---- Stage: INPUT ----
+if st.session_state["ql_stage"] == "input":
+    _audio = st.audio_input("Record (tap mic)", key=f"ql_audio_{_qg}", label_visibility="collapsed")
+    if _audio is not None:
+        if st.button("Transcribe recording →", key=f"ql_tx_{_qg}"):
+            with st.spinner("Transcribing..."):
+                _txt = transcribe_whisper(_audio.getvalue(), "note.wav")
+            _clean = (_txt or "").strip()
+            if len(_clean) < 3 or len(_clean.split()) < 2:
+                st.warning("I didn't catch that. Try again or type it.")
+            else:
+                st.session_state["ql_transcript"] = _clean
+                st.rerun()
+
+    _text = st.text_area(
+        "Tell me what happened",
+        value=st.session_state["ql_transcript"],
+        height=140,
+        key=f"ql_text_{_qg}",
+        placeholder="e.g. Just wrapped at Ellemes. Gifted Sarah 4 blueberry lemon and 3 cherry lime. Sampled about 20 and sold 7. Got three leads...",
+        label_visibility="collapsed",
+    )
+
+    if st.button("Sort it out →", key=f"ql_go_{_qg}"):
+        _raw = (_text or "").strip()
+        if len(_raw) < 3 or len(_raw.split()) < 2:
+            st.warning("I didn't catch that. Try again or type it.")
+        else:
+            with st.spinner("Sorting..."):
+                try:
+                    _parsed = parse_intake(_raw)
+                except Exception as _exc:
+                    _parsed = {}
+                    st.error(f"Parse failed: {_exc}")
+            if not (_parsed.get("intents") or []):
+                st.warning("I couldn't tell what to log from that. Can you rephrase?")
+            else:
+                _ql_prepare(_parsed, _raw)
+                st.rerun()
+
+# ---- Stage: CLARIFY ----
+elif st.session_state["ql_stage"] == "clarify":
+    _intents = st.session_state["ql_intents"]
+    st.markdown("##### A few details needed before I can log")
+    _incomplete, _complete = [], []
+    for _i, _it in enumerate(_intents):
+        if _it.get("_drop"):
+            continue
+        _miss = validate_intent(_it)
+        (_incomplete if _miss else _complete).append((_i, _it, _miss))
+    for _i, _it, _miss in _incomplete:
+        _icon = _QL_ICONS.get((_it.get("type") or "").upper(), "•")
+        st.markdown(f"**{_icon} {(_it.get('type') or '').replace('_', ' ').title()}** needs: {', '.join(_miss)}")
+
+    _ans = st.text_area("Answer (type or record below)", key=f"ql_clar_{_qg}", height=90)
+    _caudio = st.audio_input("Record answer", key=f"ql_claraud_{_qg}", label_visibility="collapsed")
+
+    _cc1, _cc2, _cc3 = st.columns(3)
+    with _cc1:
+        if st.button("Update →", key=f"ql_clarupd_{_qg}"):
+            _answer = (_ans or "").strip()
+            if _caudio is not None and not _answer:
+                with st.spinner("Transcribing..."):
+                    _answer = transcribe_whisper(_caudio.getvalue(), "ans.wav")
+            if not _answer:
+                st.warning("Add an answer first.")
+            else:
+                _combined = st.session_state["ql_raw_transcript"] + "\n\nClarifications: " + _answer
+                with st.spinner("Sorting..."):
+                    try:
+                        _p = parse_intake(_combined)
+                    except Exception as _exc:
+                        _p = {}
+                        st.error(f"Parse failed: {_exc}")
+                if _p.get("intents"):
+                    _ql_prepare(_p, _combined)
+                st.rerun()
+    with _cc2:
+        if _complete and _incomplete:
+            if st.button("Log complete only", key=f"ql_clarpart_{_qg}"):
+                for _i, _it, _miss in _incomplete:
+                    _it["_drop"] = True
+                st.session_state["ql_stage"] = "preview"
+                st.rerun()
+    with _cc3:
+        if st.button("Cancel", key=f"ql_clarcancel_{_qg}"):
+            _ql_reset()
+            st.rerun()
+
+# ---- Stage: PREVIEW ----
+elif st.session_state["ql_stage"] == "preview":
+    _intents = st.session_state["ql_intents"]
+    st.markdown("##### Confirm what I'll log")
+    _lb_idx = 1 if st.session_state["ql_logged_by"] == "Cameron" else 0
+    st.session_state["ql_logged_by"] = st.radio(
+        "Logged by", ["Kolton", "Cameron"], horizontal=True, index=_lb_idx, key=f"ql_lb_{_qg}"
+    )
+    _active = [(i, it) for i, it in enumerate(_intents) if not it.get("_drop")]
+    if not _active:
+        st.info("No records left to log.")
+    for _ty in _QL_ORDER:
+        _grp = [(i, it) for i, it in _active if (it.get("type") or "").upper() == _ty]
+        if not _grp:
+            continue
+        st.markdown(f"**{_QL_ICONS[_ty]} {_ty.replace('_', ' ').title()} ({len(_grp)})**")
+        for _i, _it in _grp:
+            _ql_render_card(_i, _it, _qg)
+
+    # Block confirm only while a genuinely-unresolvable type still needs one tap.
+    _needs_pick = [
+        _it for _i, _it in _active
+        if (_it.get("type") or "").upper() == "GIFTING"
+        and _it.get("_conf", {}).get("recipient_type") == "low"
+        and (_it.get("data") or {}).get("recipient_type") not in _QL_RT_OPTS
+    ]
+    if _needs_pick:
+        st.warning(f"Pick a recipient type for {len(_needs_pick)} record(s) above to confirm.")
+
+    _pb1, _pb2 = st.columns(2)
+    with _pb1:
+        if st.button("CONFIRM ALL →", key=f"ql_confirm_{_qg}", disabled=(not _active or bool(_needs_pick))):
+            _ql_confirm_all()
+            st.rerun()
+    with _pb2:
+        if st.button("CANCEL", key=f"ql_cancel_{_qg}"):
+            _ql_reset()
+            st.rerun()
+
+st.markdown("---")
+
 # ── Tabs ──────────────────────────────────────────────────────────────────────
 gifting_tab, event_tab, creator_tab, capture_tab, finance_tab, sales_tab, social_tab = st.tabs(["Gifting Log", "Event Wrap-Up", "Creator Applications", "📥 Capture Review", "💰 Finance", "🤝 Sales", "📊 Social"])
 
@@ -831,7 +2222,7 @@ with gifting_tab:
             with _gc1:
                 if st.button("Confirm →", key="gift_dupe_confirm_btn"):
                     with st.spinner("Saving to SharePoint…"):
-                        _ok = append_row(st.secrets["GIFTING_FILE_ID"], "GiftingLog", _gd["row"])
+                        _ok = append_cid(st.secrets["GIFTING_FILE_ID"], "GiftingLog", _gd["row"])
                     if _ok:
                         st.session_state["g_success"] = _gd["success_msg"]
                         st.session_state["g_parsed"] = {}
@@ -959,7 +2350,7 @@ with gifting_tab:
                     st.rerun()
                 else:
                     with st.spinner("Saving to SharePoint…"):
-                        ok = append_row(st.secrets["GIFTING_FILE_ID"], "GiftingLog", row)
+                        ok = append_cid(st.secrets["GIFTING_FILE_ID"], "GiftingLog", row)
                     if ok:
                         st.session_state["g_success"] = (
                             f"Logged: {recipient.strip()} · {bags_total} bags · "
@@ -1085,9 +2476,9 @@ with gifting_tab:
                     _edit_content_type,
                 ]
                 with st.spinner("Updating SharePoint…"):
-                    ok = patch_row(
+                    ok = patch_cid(
                         st.secrets["GIFTING_FILE_ID"], "GiftingLog",
-                        _row_index, _updated_row,
+                        _row_index, _updated_row, existing_vals=_vals,
                     )
                 if ok:
                     st.session_state["g_success"] = (
@@ -1111,6 +2502,9 @@ with event_tab:
     if st.session_state.get("e_post_gift_note"):
         st.info(st.session_state["e_post_gift_note"])
         st.session_state["e_post_gift_note"] = ""
+    if st.session_state.get("e_post_error"):
+        st.error(st.session_state["e_post_error"])
+        st.session_state["e_post_error"] = ""
 
     st.markdown("### Event Tracking")
 
@@ -1134,7 +2528,7 @@ with event_tab:
             with _ec1:
                 if st.button("Confirm →", key="event_dupe_confirm_btn"):
                     with st.spinner("Saving to SharePoint…"):
-                        _ok = append_row(st.secrets["EVENTS_FILE_ID"], "EventLog", _ed["row"])
+                        _ok = append_cid(st.secrets["EVENTS_FILE_ID"], "EventLog", _ed["row"])
                     if _ok:
                         st.session_state["e_pre_success"] = _ed["success_msg"]
                         st.session_state["event_dupe_confirm"] = False
@@ -1211,7 +2605,7 @@ with event_tab:
                     st.rerun()
                 else:
                     with st.spinner("Saving to SharePoint…"):
-                        ok = append_row(st.secrets["EVENTS_FILE_ID"], "EventLog", row)
+                        ok = append_cid(st.secrets["EVENTS_FILE_ID"], "EventLog", row)
                     if ok:
                         st.session_state["e_pre_success"] = (
                             f"Pre-logged: {e_venue.strip()} on {e_event_date.isoformat()}"
@@ -1259,8 +2653,15 @@ with event_tab:
                 row_index, row_vals = pre_logged[sel]
 
                 with st.form("post_event_form", clear_on_submit=True):
-                    sampled = st.number_input("Sampled", min_value=0, step=1, value=0)
-                    sold = st.number_input("Sold", min_value=0, step=1, value=0)
+                    st.caption("Sampled (per flavor)")
+                    _ps1, _ps2, _ps3 = st.columns(3)
+                    with _ps1:
+                        sampled_bl = st.number_input("Blueberry Lemon", min_value=0, step=1, value=0, key="pe_smp_bl")
+                    with _ps2:
+                        sampled_cl = st.number_input("Cherry Lime", min_value=0, step=1, value=0, key="pe_smp_cl")
+                    with _ps3:
+                        sampled_pm = st.number_input("Peach Mango", min_value=0, step=1, value=0, key="pe_smp_pm")
+                    sold = st.number_input("Sold (total)", min_value=0, step=1, value=0)
                     leads = st.number_input("Leads", min_value=0, step=1, value=0)
                     followups = st.number_input("Followups", min_value=0, step=1, value=0)
                     post_notes = st.text_area(
@@ -1272,6 +2673,7 @@ with event_tab:
                     post_submit = st.form_submit_button("Complete Event →")
 
                 if post_submit:
+                    sampled = int(sampled_bl) + int(sampled_cl) + int(sampled_pm)
                     updated_row = [
                         row_vals[0],         # Timestamp (original, preserve)
                         row_vals[1],         # Venue
@@ -1279,7 +2681,7 @@ with event_tab:
                         row_vals[3],         # EventDate
                         row_vals[4],         # BagsAllocated
                         row_vals[5],         # LoggedBy
-                        int(sampled),
+                        sampled,             # Sampled total (sum of the three SKUs)
                         int(sold),
                         int(leads),
                         int(followups),
@@ -1287,30 +2689,51 @@ with event_tab:
                         "Complete",
                     ]
                     with st.spinner("Updating SharePoint…"):
-                        ok = patch_row(st.secrets["EVENTS_FILE_ID"], "EventLog", row_index, updated_row)
+                        ok = patch_cid(st.secrets["EVENTS_FILE_ID"], "EventLog", row_index, updated_row,
+                                       existing_vals=row_vals)
                     if ok:
-                        if int(sampled) > 0:
+                        _gift_ok = True
+                        if sampled > 0:
                             _ev_gift_row = [
                                 datetime.now().isoformat(timespec="seconds"),
                                 row_vals[1],
                                 "Event",
-                                0, 0, 0,
-                                int(sampled),
+                                int(sampled_bl), int(sampled_cl), int(sampled_pm),
+                                sampled,
                                 row_vals[1],
                                 row_vals[3],
                                 row_vals[5],
-                                "Auto-created from event wrap-up — update flavor breakdown if known",
+                                "Auto-created from event wrap-up (per-SKU sampled counts)",
                                 "No", "", "",
                             ]
-                            append_row(st.secrets["GIFTING_FILE_ID"], "GiftingLog", _ev_gift_row)
+                            try:
+                                _gift_ok = append_cid(st.secrets["GIFTING_FILE_ID"], "GiftingLog", _ev_gift_row)
+                            except Exception as _gexc:
+                                _gift_ok = False
+                                st.error(f"Auto-gifting append crashed: {_gexc}")
+                            if _gift_ok:
+                                st.session_state["e_post_gift_note"] = (
+                                    f"Gifting entry auto-created for {row_vals[1]} with per-SKU "
+                                    f"sampled counts (BL {int(sampled_bl)}, CL {int(sampled_cl)}, "
+                                    f"PM {int(sampled_pm)})."
+                                )
+                            else:
+                                st.session_state["e_post_error"] = (
+                                    f"Event '{row_vals[1]}' was saved, but the auto-gifting "
+                                    "GiftingLog row FAILED to write, so the sampled bags did NOT "
+                                    "deduct from inventory. See the error above and retry the wrap-up."
+                                )
+                        else:
                             st.session_state["e_post_gift_note"] = (
-                                f"Gifting entry auto-created for {row_vals[1]} — "
-                                "update flavor breakdown in Gifting Log when known."
+                                "No sampled bags entered (BL+CL+PM = 0), so no gifting row or "
+                                "inventory deduction was created."
                             )
-                        st.session_state["e_post_success"] = (
-                            f"Completed: {row_vals[1]} — {row_vals[3]}"
-                        )
-                        st.rerun()
+                        if _gift_ok:
+                            st.session_state["e_post_success"] = (
+                                f"Completed: {row_vals[1]} — {row_vals[3]}"
+                            )
+                            st.rerun()
+                        # On gift-append failure, do not rerun: keep the inline error visible.
 
         # ── Sub-mode: Log standalone post-event ───────────────────────────────
         else:
@@ -1323,8 +2746,15 @@ with event_tab:
                 sp_venue_type = st.selectbox("Venue Type *", _venue_type_opts)
                 sp_event_date = st.date_input("Event Date *", value=date.today())
                 sp_bags = st.number_input("Bags Allocated *", min_value=0, step=1, value=0)
-                sp_sampled = st.number_input("Sampled", min_value=0, step=1, value=0)
-                sp_sold = st.number_input("Sold", min_value=0, step=1, value=0)
+                st.caption("Sampled (per flavor)")
+                _sps1, _sps2, _sps3 = st.columns(3)
+                with _sps1:
+                    sp_sampled_bl = st.number_input("Blueberry Lemon", min_value=0, step=1, value=0, key="sp_smp_bl")
+                with _sps2:
+                    sp_sampled_cl = st.number_input("Cherry Lime", min_value=0, step=1, value=0, key="sp_smp_cl")
+                with _sps3:
+                    sp_sampled_pm = st.number_input("Peach Mango", min_value=0, step=1, value=0, key="sp_smp_pm")
+                sp_sold = st.number_input("Sold (total)", min_value=0, step=1, value=0)
                 sp_leads = st.number_input("Leads", min_value=0, step=1, value=0)
                 sp_followups = st.number_input("Followups", min_value=0, step=1, value=0)
                 sp_logged_by = st.radio(
@@ -1349,6 +2779,7 @@ with event_tab:
                     for err in sp_errors:
                         st.error(err)
                 else:
+                    sp_sampled = int(sp_sampled_bl) + int(sp_sampled_cl) + int(sp_sampled_pm)
                     sp_row = [
                         datetime.now().isoformat(timespec="seconds"),
                         sp_venue.strip(),
@@ -1356,7 +2787,7 @@ with event_tab:
                         sp_event_date.isoformat(),
                         int(sp_bags),
                         sp_logged_by,
-                        int(sp_sampled),
+                        sp_sampled,          # Sampled total (sum of the three SKUs)
                         int(sp_sold),
                         int(sp_leads),
                         int(sp_followups),
@@ -1364,30 +2795,50 @@ with event_tab:
                         "Complete",
                     ]
                     with st.spinner("Saving to SharePoint…"):
-                        ok = append_row(st.secrets["EVENTS_FILE_ID"], "EventLog", sp_row)
+                        ok = append_cid(st.secrets["EVENTS_FILE_ID"], "EventLog", sp_row)
                     if ok:
-                        if int(sp_sampled) > 0:
+                        _sp_gift_ok = True
+                        if sp_sampled > 0:
                             _sp_gift_row = [
                                 datetime.now().isoformat(timespec="seconds"),
                                 sp_venue.strip(),
                                 "Event",
-                                0, 0, 0,
-                                int(sp_sampled),
+                                int(sp_sampled_bl), int(sp_sampled_cl), int(sp_sampled_pm),
+                                sp_sampled,
                                 sp_venue.strip(),
                                 sp_event_date.isoformat(),
                                 sp_logged_by,
-                                "Auto-created from event wrap-up — update flavor breakdown if known",
+                                "Auto-created from event wrap-up (per-SKU sampled counts)",
                                 "No", "", "",
                             ]
-                            append_row(st.secrets["GIFTING_FILE_ID"], "GiftingLog", _sp_gift_row)
+                            try:
+                                _sp_gift_ok = append_cid(st.secrets["GIFTING_FILE_ID"], "GiftingLog", _sp_gift_row)
+                            except Exception as _spgexc:
+                                _sp_gift_ok = False
+                                st.error(f"Auto-gifting append crashed: {_spgexc}")
+                            if _sp_gift_ok:
+                                st.session_state["e_post_gift_note"] = (
+                                    f"Gifting entry auto-created for {sp_venue.strip()} with per-SKU "
+                                    f"sampled counts (BL {int(sp_sampled_bl)}, CL {int(sp_sampled_cl)}, "
+                                    f"PM {int(sp_sampled_pm)})."
+                                )
+                            else:
+                                st.session_state["e_post_error"] = (
+                                    f"Event '{sp_venue.strip()}' was saved, but the auto-gifting "
+                                    "GiftingLog row FAILED to write, so the sampled bags did NOT "
+                                    "deduct from inventory. See the error above and retry the wrap-up."
+                                )
+                        else:
                             st.session_state["e_post_gift_note"] = (
-                                f"Gifting entry auto-created for {sp_venue.strip()} — "
-                                "update flavor breakdown in Gifting Log when known."
+                                "No sampled bags entered (BL+CL+PM = 0), so no gifting row or "
+                                "inventory deduction was created."
                             )
-                        st.session_state["e_post_success"] = (
-                            f"Logged: {sp_venue.strip()} — {sp_event_date.isoformat()}"
-                        )
-                        st.rerun()
+                        if _sp_gift_ok:
+                            st.session_state["e_post_success"] = (
+                                f"Logged: {sp_venue.strip()} — {sp_event_date.isoformat()}"
+                            )
+                            st.rerun()
+                        # On gift-append failure, do not rerun: keep the inline error visible.
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1457,7 +2908,7 @@ with creator_tab:
                 try:
                     _ac = anthropic.Anthropic(api_key=st.secrets["ANTHROPIC_API_KEY"])
                     _amsg = _ac.messages.create(
-                        model="claude-sonnet-4-5",
+                        model=CLAUDE_MODEL,
                         max_tokens=10000,
                         messages=[{
                             "role": "user",
@@ -1570,7 +3021,7 @@ with creator_tab:
                                 "",
                                 ca_logged_by,
                             ]
-                            if not append_row(
+                            if not append_with_test(
                                 st.secrets["CREATOR_FILE_ID"], "CreatorApplications", _creator_row
                             ):
                                 _had_error = True
@@ -1591,7 +3042,7 @@ with creator_tab:
                                         "",
                                         "",
                                     ]
-                                    append_row(
+                                    append_cid(
                                         st.secrets["GIFTING_FILE_ID"], "GiftingLog", _hist_gift_row
                                     )
 
@@ -1639,7 +3090,7 @@ with creator_tab:
                         try:
                             _ac = anthropic.Anthropic(api_key=st.secrets["ANTHROPIC_API_KEY"])
                             _amsg = _ac.messages.create(
-                                model="claude-sonnet-4-5",
+                                model=CLAUDE_MODEL,
                                 max_tokens=15000,
                                 messages=[{
                                     "role": "user",
@@ -1797,7 +3248,7 @@ with creator_tab:
                                 str(_app.get("wholesale_flag", False)),
                                 ca_logged_by,
                             ]
-                            if not append_row(
+                            if not append_with_test(
                                 st.secrets["CREATOR_FILE_ID"], "CreatorApplications", _creator_row
                             ):
                                 _had_error = True
@@ -1819,7 +3270,7 @@ with creator_tab:
                                     "",
                                     "",
                                 ]
-                                if not append_row(
+                                if not append_cid(
                                     st.secrets["GIFTING_FILE_ID"], "GiftingLog", _gifting_row
                                 ):
                                     _had_error = True
@@ -2060,7 +3511,7 @@ with capture_tab:
                 with _mdc1:
                     if st.button("Confirm →", key=f"mtg_dupe_confirm_btn_{_cgen}"):
                         with st.spinner("Saving to SharePoint..."):
-                            _ok = append_row(
+                            _ok = append_cid(
                                 st.secrets["MEETINGS_FILE_ID"], "MeetingLog",
                                 _mdd["row"], site_id=st.secrets["STRATEGY_SITE_ID"],
                             )
@@ -2153,7 +3604,7 @@ with capture_tab:
                     st.rerun()
                 else:
                     with st.spinner("Saving to SharePoint..."):
-                        _ok = append_row(st.secrets["MEETINGS_FILE_ID"], "MeetingLog", _mtg_row,
+                        _ok = append_cid(st.secrets["MEETINGS_FILE_ID"], "MeetingLog", _mtg_row,
                                         site_id=st.secrets["STRATEGY_SITE_ID"])
                     if _ok:
                         st.session_state["cap_lead_prompt"] = _cap_lead_prompt_data
@@ -2289,7 +3740,7 @@ with capture_tab:
                 with _vdc1:
                     if st.button("Confirm →", key=f"vid_dupe_confirm_btn_{_cgen}"):
                         with st.spinner("Saving to SharePoint..."):
-                            _ok = append_row(
+                            _ok = append_cid(
                                 st.secrets["VIDEO_FILE_ID"], "VideoIdeas",
                                 _vdd["row"], site_id=st.secrets["STRATEGY_SITE_ID"],
                             )
@@ -2351,7 +3802,7 @@ with capture_tab:
                     st.rerun()
                 else:
                     with st.spinner("Saving to SharePoint..."):
-                        _ok = append_row(st.secrets["VIDEO_FILE_ID"], "VideoIdeas", _vid_row,
+                        _ok = append_cid(st.secrets["VIDEO_FILE_ID"], "VideoIdeas", _vid_row,
                                         site_id=st.secrets["STRATEGY_SITE_ID"])
                     if _ok:
                         st.session_state["cap_success"] = _vid_success_msg
@@ -2371,17 +3822,26 @@ with capture_tab:
     _mtg_fid = st.secrets.get("MEETINGS_FILE_ID", "paste-your-value-here")
     _vid_fid = st.secrets.get("VIDEO_FILE_ID", "paste-your-value-here")
 
+    # Absolute status-column positions (unchanged by a trailing ClientId column):
+    # MeetingLog status at index 21, VideoIdeas status at index 13.
+    _MTG_STATUS_IDX = 21
+    _VID_STATUS_IDX = 13
     if _mtg_fid not in ("paste-your-value-here", ""):
         with st.spinner("Loading pending captures..."):
-            _mtg_pending = _get_pending_rows(_mtg_fid, "MeetingLog")
+            _mtg_pending = _get_pending_rows(_mtg_fid, "MeetingLog", _MTG_STATUS_IDX)
     if _vid_fid not in ("paste-your-value-here", ""):
-        _vid_pending = _get_pending_rows(_vid_fid, "VideoIdeas")
+        _vid_pending = _get_pending_rows(_vid_fid, "VideoIdeas", _VID_STATUS_IDX)
 
     _all_pending = (
         [("meeting", ri, v) for ri, v in _mtg_pending] +
         [("video", ri, v) for ri, v in _vid_pending]
     )
-    _all_pending.sort(key=lambda x: x[2][-2] if len(x[2]) >= 2 else "", reverse=True)
+    # Timestamp lives at index 0 for MeetingLog and index 14 for VideoIdeas.
+    def _pending_ts(item):
+        _t, _ri, _v = item
+        _ti = 0 if _t == "meeting" else 14
+        return str(_v[_ti]) if len(_v) > _ti else ""
+    _all_pending.sort(key=_pending_ts, reverse=True)
 
     if not _all_pending:
         st.caption("No pending captures. All confirmed.")
@@ -2392,7 +3852,7 @@ with capture_tab:
             _errs = 0
             for _ptype, _ri, _pvals in _all_pending:
                 _new_vals = list(_pvals)
-                _new_vals[-3] = "confirmed"
+                _new_vals[21 if _ptype == "meeting" else 13] = "confirmed"
                 _fid = _mtg_fid if _ptype == "meeting" else _vid_fid
                 _tbl = "MeetingLog" if _ptype == "meeting" else "VideoIdeas"
                 if not patch_row(_fid, _tbl, _ri, _new_vals):
@@ -2423,14 +3883,14 @@ with capture_tab:
             with _pc2:
                 if st.button("Confirm", key=f"cap_conf_{_ptype}_{_ri}"):
                     _new_vals = list(_pvals)
-                    _new_vals[-3] = "confirmed"
+                    _new_vals[21 if _ptype == "meeting" else 13] = "confirmed"
                     with st.spinner("Confirming..."):
                         patch_row(_fid, _tbl, _ri, _new_vals)
                     st.rerun()
             with _pc3:
                 if st.button("Discard", key=f"cap_disc_{_ptype}_{_ri}"):
                     _new_vals = list(_pvals)
-                    _new_vals[-3] = "discarded"
+                    _new_vals[21 if _ptype == "meeting" else 13] = "discarded"
                     with st.spinner("Discarding..."):
                         patch_row(_fid, _tbl, _ri, _new_vals)
                     st.rerun()
@@ -2562,7 +4022,7 @@ with finance_tab:
         )
         _ac = anthropic.Anthropic(api_key=st.secrets["ANTHROPIC_API_KEY"])
         _msg = _ac.messages.create(
-            model="claude-sonnet-4-5",
+            model=CLAUDE_MODEL,
             max_tokens=4096,
             system=_sys,
             messages=[{"role": "user", "content": f"Categorize these transactions:\n{json.dumps(txns)}"}],
@@ -3043,7 +4503,7 @@ with sales_tab:
         with _sdc1:
             if st.button("Confirm →", key=f"sales_dupe_confirm_btn_{_sgen}"):
                 with st.spinner("Saving to SharePoint…"):
-                    _ok = append_row(
+                    _ok = append_with_test(
                         st.secrets["SALES_FILE_ID"],
                         "SalesLeads",
                         _sdd["values"],
@@ -3118,7 +4578,7 @@ with sales_tab:
                 st.rerun()
             else:
                 with st.spinner("Saving to SharePoint…"):
-                    _ok = append_row(
+                    _ok = append_with_test(
                         st.secrets["SALES_FILE_ID"],
                         "SalesLeads",
                         _values,
@@ -3270,7 +4730,7 @@ with social_tab:
                     _si_content.append({"type": "text", "text": _si_prompt})
                     _si_ac = anthropic.Anthropic(api_key=st.secrets["ANTHROPIC_API_KEY"])
                     _si_msg = _si_ac.messages.create(
-                        model="claude-sonnet-4-5",
+                        model=CLAUDE_MODEL,
                         max_tokens=512,
                         messages=[{"role": "user", "content": _si_content}],
                     )
